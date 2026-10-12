@@ -96,7 +96,7 @@ cat > "${PLUGIN_DIR}/DeviceOverview.php" <<'EOF_NETCMDPLUGIN_2'
 /*
  * Netcmd - LibreNMS local plugin
  * Device overview bar (Cisco IOS / IOS-XE): new netcmd run with this device preselected,
- * and netcmd history of this device.
+ * MAC trace starting from this device, and netcmd history of this device.
  */
 
 namespace App\Plugins\Netcmd;
@@ -119,6 +119,7 @@ class DeviceOverview extends DeviceOverviewHook
 
         return [
             'runUrl' => $base . '/?' . http_build_query(['ip' => $ip]),
+            'macTraceUrl' => $base . '/mactrace?' . http_build_query(['ip' => $ip]),
             'historyUrl' => $base . '/devices?' . http_build_query(['ip' => $ip]),
             'homeUrl' => $base . '/',
         ];
@@ -133,6 +134,7 @@ cat > "${PLUGIN_DIR}/resources/views/device-overview.blade.php" <<'EOF_NETCMDPLU
     <div class="tw:px-4 tw:py-2.5 tw:bg-neutral-100 tw:text-neutral-700 tw:dark:bg-dark-gray-200 tw:dark:text-dark-white-200">
         <i class="fa fa-terminal fa-fw" aria-hidden="true"></i> <strong>netcmd</strong>
         <a href="{{ $runUrl }}" target="_blank" rel="noopener" style="margin-left:15px">New run on this device</a>
+        <a href="{{ $macTraceUrl }}" target="_blank" rel="noopener" style="margin-left:15px">MAC trace from this device</a>
         <a href="{{ $historyUrl }}" target="_blank" rel="noopener" style="margin-left:15px">Command history of this device</a>
         <a href="{{ $homeUrl }}" target="_blank" rel="noopener" style="margin-left:15px">Open netcmd</a>
     </div>

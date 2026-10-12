@@ -3,7 +3,7 @@
 /*
  * Netcmd - LibreNMS local plugin
  * Device overview bar (Cisco IOS / IOS-XE): new netcmd run with this device preselected,
- * and netcmd history of this device.
+ * MAC trace starting from this device, and netcmd history of this device.
  */
 
 namespace App\Plugins\Netcmd;
@@ -26,6 +26,7 @@ class DeviceOverview extends DeviceOverviewHook
 
         return [
             'runUrl' => $base . '/?' . http_build_query(['ip' => $ip]),
+            'macTraceUrl' => $base . '/mactrace?' . http_build_query(['ip' => $ip]),
             'historyUrl' => $base . '/devices?' . http_build_query(['ip' => $ip]),
             'homeUrl' => $base . '/',
         ];

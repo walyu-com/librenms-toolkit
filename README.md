@@ -6,10 +6,10 @@ Companion tools for a [LibreNMS](https://www.librenms.org/) server managing Cisc
 
 | Component | Type | Purpose |
 |---|---|---|
-| [NetCmd](netcmd/) | Standalone web app (Python, port 8090) | Send the same CLI commands to many Cisco devices (SSH / Telnet), with per-device history and outputs |
+| [NetCmd](netcmd/) | Standalone web app (Python, port 8090) | Send the same CLI commands to many Cisco devices (SSH / Telnet), with per-device history and outputs; MAC Trace (locate the switch port of a MAC address) |
 | [CiscoEox](plugins/CiscoEox/) | LibreNMS local plugin | Cisco PSIRT advisories (openVuln API) and hardware / software End-of-Life dates on each device page |
 | [Comment](plugins/Comment/) | LibreNMS local plugin | Device notes with Markdown, simple HTML, line breaks, inline editor and a common first line |
-| [Netcmd](plugins/Netcmd/) | LibreNMS local plugin | Menu entry and device page links to NetCmd |
+| [Netcmd](plugins/Netcmd/) | LibreNMS local plugin | Menu entry and device page links to NetCmd (new run, MAC trace, history) |
 
 Developed for Ubuntu 26.04 with the current LibreNMS (Laravel 12, PHP 8.5).
 
@@ -51,6 +51,14 @@ sudo mv /opt/librenms/app/Plugins/<Name> /root/<Name>.removed
 - History in SQLite (runs, per-device outputs), text export. Passwords are never stored.
 - Settings page: links from device names to LibreNMS, `telnet://` and `ssh://` links, group badges,
   custom logo (browser tab and title bar).
+- MAC Trace page: locates the switch port of a MAC address (any notation). Start switches are chosen
+  from the device list and tried in order. On each switch, `show mac address-table address <mac>`
+  gives the port; when the port (or, for a Port-channel, one of its members) is a trunk with a CDP
+  neighbor, the trace continues on the neighbor management IP; otherwise the port is the final port
+  (`show mac address-table interface` and the `show lldp neighbors` line of the port). Every switch
+  traversed is linked to LibreNMS; traces are kept in the history with a text export. IP addresses
+  are not accepted as input: ARP tables are per VRF. Port of
+  [CiscoMacTrace](https://github.com/walyu-com/CiscoMacTrace).
 - Configuration: `/etc/netcmd/netcmd.env` (LibreNMS URL and API token, OS filter, timeouts, port).
 
 NetCmd has no authentication of its own: restrict access to port 8090 (firewall) to the admin
@@ -95,6 +103,7 @@ Built on and for:
 | [LibreNMS](https://www.librenms.org/) | Host application of the plugins, device inventory API | GPL-3.0-or-later |
 | [Netmiko](https://github.com/ktbyers/netmiko) | SSH / Telnet sessions to the devices (NetCmd) | MIT |
 | [Flask](https://flask.palletsprojects.com/) / [Waitress](https://docs.pylonsproject.org/projects/waitress/) | NetCmd web application and server | BSD-3-Clause / ZPL-2.1 |
+| [CiscoMacTrace](https://github.com/walyu-com/CiscoMacTrace) | MAC Trace logic (NetCmd), same author | Apache-2.0 |
 | [Requests](https://requests.readthedocs.io/) | NetCmd calls to the LibreNMS API | Apache-2.0 |
 | [Cisco PSIRT openVuln API](https://developer.cisco.com/docs/psirt/) | Security advisories (CiscoEox) | Cisco API terms of service |
 

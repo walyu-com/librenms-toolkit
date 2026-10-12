@@ -6,8 +6,11 @@ Device list : LibreNMS API (/api/v0/devices), filtered by OS.
 Execution   : Netmiko, one thread per device (bounded pool).
 History     : SQLite, one row per run and one row per device result,
               including the full device output. Passwords are never stored.
+MAC Trace   : hop-by-hop search of a MAC address (MAC table, trunk + CDP neighbor),
+              port of CiscoMacTrace (Walyu PTE LTD, Apache-2.0).
 """
 
+import json
 import os
 import re
 import sqlite3
@@ -119,6 +122,13 @@ def db_init():
         cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()]
         if "enable_mode" not in cols:
             conn.execute("ALTER TABLE runs ADD COLUMN enable_mode INTEGER DEFAULT 1")
+        if "kind" not in cols:  # 'cmd' (commands run) or 'mactrace'
+            conn.execute("ALTER TABLE runs ADD COLUMN kind TEXT DEFAULT 'cmd'")
+        if "summary" not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN summary TEXT")
+        rcols = [r[1] for r in conn.execute("PRAGMA table_info(results)").fetchall()]
+        if "extra" not in rcols:  # MAC trace hop details (JSON)
+            conn.execute("ALTER TABLE results ADD COLUMN extra TEXT")
 
 
 def now():
@@ -434,6 +444,297 @@ def run_job(run_id, jobs, auth, commands, protocol):
 
 
 # ---------------------------------------------------------------------------
+# MAC trace (port of CiscoMacTrace, Walyu PTE LTD, Apache-2.0)
+#   For each start switch, in order, until the MAC is located:
+#     show mac address-table address <mac>  -> interface + VLAN
+#     interface (or one of its Port-channel members) is a trunk with a CDP
+#     neighbor -> connect to the neighbor management IP (next hop)
+#     otherwise -> final port: MAC table of the port + LLDP neighbor line
+# ---------------------------------------------------------------------------
+TRACE_MAX_HOPS = 30
+
+# interface prefix (lowercase, as written by IOS / IOS-XE in long or short form) -> short form
+_IF_PREFIX = [
+    (("twentyfivegige", "twentyfivegigabitethernet", "twe"), "Twe"),
+    (("twogigabitethernet", "two", "tw"), "Tw"),
+    (("tengigabitethernet", "tengige", "ten", "te"), "Te"),
+    (("fivegigabitethernet", "fivegige", "fiv", "fi"), "Fi"),
+    (("fortygigabitethernet", "fortygige", "for", "fo"), "Fo"),
+    (("hundredgigabitethernet", "hundredgige", "hun", "hu"), "Hu"),
+    (("appgigabitethernet", "app", "ap"), "Ap"),
+    (("gigabitethernet", "gige", "gig", "gi"), "Gi"),
+    (("fastethernet", "fas", "fa"), "Fa"),
+    (("port-channel", "port", "po"), "Po"),
+    (("ethernet", "eth", "et"), "Et"),
+]
+IF_TOKEN_RE = re.compile(r"\b([A-Za-z][A-Za-z\-]*)\s?(\d+(?:/\d+)*(?:\.\d+)?)\b")
+
+
+class TraceError(Exception):
+    pass
+
+
+def normalize_mac(mac):
+    """Any common MAC format -> xxxx.xxxx.xxxx, or None."""
+    cleaned = re.sub(r"[^0-9a-f]", "", (mac or "").strip().lower())
+    if len(cleaned) != 12:
+        return None
+    return "%s.%s.%s" % (cleaned[0:4], cleaned[4:8], cleaned[8:12])
+
+
+def if_key(name):
+    """Interface name -> short canonical form: 'GigabitEthernet1/0/5', 'Gig 1/0/5', 'Gi1/0/5' -> 'Gi1/0/5'."""
+    m = re.match(r"^\s*([A-Za-z][A-Za-z\-]*)\s*(\d+(?:/\d+)*(?:\.\d+)?)\s*$", name or "")
+    if not m:
+        return (name or "").strip()
+    prefix, num = m.group(1).lower(), m.group(2)
+    for names, short in _IF_PREFIX:
+        if prefix in names:
+            return short + num
+    return m.group(1)[:1].upper() + m.group(1)[1:2].lower() + num
+
+
+def if_tokens(line):
+    """Canonical names of every interface-looking token of a line."""
+    return [if_key(a + b) for a, b in IF_TOKEN_RE.findall(line)]
+
+
+def parse_mac_table(output, mac):
+    """'show mac address-table address <mac>' -> (interface, vlan, line, count) or (None, None, None, 0)."""
+    found = []
+    for ln in output.splitlines():
+        s = ln.strip()
+        if mac in s.lower() and re.search(r"\b(dynamic|static)\b", s, re.IGNORECASE):
+            found.append(s)
+    if not found:
+        return None, None, None, 0
+    s = found[0]
+    m_vlan = re.match(r"^\*?\s*(\d+)\s+", s)
+    return if_key(s.split()[-1]), (m_vlan.group(1) if m_vlan else ""), s, len(found)
+
+
+def parse_cdp_detail(output):
+    """'show cdp neighbors detail' -> {local interface: {ip, device, platform, capabilities}}."""
+    neighbors = {}
+    for b in re.split(r"\n\s*-{10,}\s*\n", "\n" + output + "\n"):
+        m_int = re.search(r"Interface:\s*([^,\r\n]+),", b, re.IGNORECASE)
+        if not m_int:
+            continue
+        mgmt = re.findall(r"Management address\(es\):\s*(?:\n\s*)*IP address:\s*(\d+\.\d+\.\d+\.\d+)", b, re.IGNORECASE)
+        entry = re.findall(r"Entry address\(es\):\s*(?:\n\s*)*IP address:\s*(\d+\.\d+\.\d+\.\d+)", b, re.IGNORECASE)
+        ip = mgmt[-1] if mgmt else (entry[0] if entry else "")
+        dev = re.search(r"Device ID:\s*(\S+)", b)
+        plat = re.search(r"Platform:\s*([^,\r\n]+)", b)
+        cap = re.search(r"Capabilities:\s*([^\r\n]+)", b)
+        neighbors[if_key(m_int.group(1).strip())] = {
+            "ip": ip,
+            "device": dev.group(1) if dev else "",
+            "platform": plat.group(1).strip() if plat else "",
+            "capabilities": cap.group(1).strip() if cap else "",
+        }
+    return neighbors
+
+
+def parse_po_members(output):
+    """'show interfaces Port-channelN' -> member interfaces (canonical)."""
+    m = re.search(r"Members in this channel:\s*([^\r\n]+)", output, re.IGNORECASE)
+    return if_tokens(m.group(1)) if m else []
+
+
+def filter_lldp(output, intf):
+    """Header + lines of 'show lldp neighbors' whose local interface is intf."""
+    header, data, header_done = [], [], False
+    for ln in output.splitlines():
+        if not ln.strip():
+            continue
+        if not header_done:
+            header.append(ln)
+            if re.search(r"Local\s+Intf|Local\s+Interface", ln, re.IGNORECASE):
+                header_done = True
+            continue
+        if intf in if_tokens(ln):
+            data.append(ln)
+    if data and header_done:
+        return "\n".join(header + data)
+    return "(no LLDP neighbor on %s in 'show lldp neighbors')" % intf
+
+
+def _show(conn, cmd, prompt, transcript):
+    """Send a show command, keep it in the transcript, return the output."""
+    try:
+        out = conn.send_command(cmd, expect_string=device_only_prompt_re(conn), read_timeout=CMD_TIMEOUT)
+    except ReadTimeout:
+        transcript.append("%s%s\n!!! no prompt received within %ss" % (prompt, cmd, CMD_TIMEOUT))
+        raise TraceError("Timeout on: " + cmd)
+    transcript.append("%s%s\n%s" % (prompt, cmd, out.rstrip()))
+    return out
+
+
+def _show_mac(conn, args, prompt, transcript):
+    """'show mac address-table ...', with the older 'show mac-address-table ...' syntax as fallback."""
+    out = _show(conn, "show mac address-table " + args, prompt, transcript)
+    if any(m in out for m in ERR_MARKERS):
+        out = _show(conn, "show mac-address-table " + args, prompt, transcript)
+    return out
+
+
+def _connect_any(ip, auth, protocol):
+    """Same protocol rules as a run: return (conn, proto, error)."""
+    order = ["ssh", "telnet"] if protocol == "auto" else [protocol]
+    last_error = ""
+    for proto in order:
+        try:
+            return _connect(ip, auth["user"], auth["password"], proto), proto, ""
+        except NetmikoAuthenticationException:
+            return None, proto, "Authentication failed (%s)" % proto
+        except NetmikoTimeoutException:
+            last_error = "Timeout / unreachable (%s)" % proto
+        except Exception as exc:
+            last_error = "%s (%s)" % (str(exc).splitlines()[0] if str(exc) else type(exc).__name__, proto)
+    return None, "", last_error
+
+
+def trace_hop(ip, auth, protocol, mac):
+    """
+    One switch of the trace. Return dict:
+      status : transit | found | not_found | conn_error | cmd_error
+      error  : one-line detail
+      name, protocol_used, output, extra{vlan, intf, line, count, next_ip, next_name, members}
+    """
+    res = {"status": "cmd_error", "error": "", "name": "", "protocol_used": "", "output": "", "extra": {}}
+    conn, proto, err = _connect_any(ip, auth, protocol)
+    res["protocol_used"] = proto
+    if conn is None:
+        res.update(status="conn_error", error=err)
+        return res
+    parts = []
+    try:
+        res["name"] = (getattr(conn, "base_prompt", "") or "").strip()
+        try:
+            err = enter_enable(conn, auth, parts)
+        except ReadTimeout:
+            err = "Enable failed: no prompt received"
+        if err:
+            res.update(status="conn_error", error=err)
+            return res
+        prompt = conn.find_prompt().strip()
+
+        out = _show_mac(conn, "address " + mac, prompt, parts)
+        intf, vlan, line, count = parse_mac_table(out, mac)
+        if not intf:
+            res.update(status="not_found", error="MAC not in the MAC address table")
+            return res
+        ex = res["extra"]
+        ex.update(intf=intf, vlan=vlan, line=line, count=count)
+
+        # a Port-channel is not listed by CDP: its member interfaces are
+        candidates = [intf]
+        if intf.startswith("Po"):
+            members = parse_po_members(_show(conn, "show interfaces " + intf, prompt, parts))
+            ex["members"] = members
+            candidates = members or [intf]
+
+        cdp = parse_cdp_detail(_show(conn, "show cdp neighbors detail", prompt, parts))
+        for cand in candidates:
+            nb = cdp.get(cand)
+            if not nb or not nb["ip"]:
+                continue
+            sw = _show(conn, "show interfaces %s switchport" % cand, prompt, parts)
+            if re.search(r"(Administrative|Operational) Mode:\s*trunk", sw, re.IGNORECASE):
+                ex.update(next_ip=nb["ip"], next_name=nb["device"], next_platform=nb["platform"], via=cand)
+                res.update(status="transit", error="VLAN %s - %s trunk to %s (%s)" % (
+                    vlan or "-", intf + ("" if cand == intf else " via " + cand), nb["device"] or "?", nb["ip"]))
+                return res
+
+        # final port
+        _show_mac(conn, "interface " + intf, prompt, parts)
+        lldp = filter_lldp(_show(conn, "show lldp neighbors", prompt, parts), intf)
+        parts.append("--- LLDP neighbor on %s ---\n%s" % (intf, lldp))
+        ex["lldp"] = lldp
+        res.update(status="found", error="VLAN %s - port %s%s" % (
+            vlan or "-", intf, (" (%d entries for this MAC, first one used)" % count) if count > 1 else ""))
+        return res
+    except TraceError as exc:
+        res.update(status="cmd_error", error=str(exc))
+        return res
+    except Exception as exc:
+        res.update(status="conn_error", error="Session error: %s" % exc)
+        return res
+    finally:
+        res["output"] = "\n".join(parts)
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+
+def _new_hop(run_id, ip, name, extra):
+    with db_lock, db() as conn:
+        cur = conn.execute("INSERT INTO results(run_id, ip, name, status, started, extra) VALUES(?,?,?,'running',?,?)",
+                           (run_id, ip, name or ip, now(), json.dumps(extra)))
+        return cur.lastrowid
+
+
+def _save_hop(hop_id, res, extra, t0):
+    with db_lock, db() as conn:
+        conn.execute(
+            "UPDATE results SET name=COALESCE(NULLIF(?, ''), name), status=?, error=?, protocol_used=?, output=?, duration=?, extra=? WHERE id=?",
+            (res["name"], res["status"], res["error"], res["protocol_used"], res["output"],
+             round(time.time() - t0, 1), json.dumps(extra), hop_id),
+        )
+
+
+def trace_job(run_id, starts, auth, protocol, mac, max_hops):
+    """Try each start switch in order; stop at the first one that locates the MAC."""
+    summary = ""
+    last_seen = None
+    last_fail = ""
+    try:
+        for attempt, (start_ip, start_name) in enumerate(starts, 1):
+            visited = set()
+            ip, name = start_ip, start_name
+            for hop in range(1, max_hops + 1):
+                extra = {"attempt": attempt, "hop": hop}
+                if ip in visited:
+                    hid = _new_hop(run_id, ip, name, extra)
+                    _save_hop(hid, {"name": "", "status": "cmd_error", "error": "Loop: switch already visited in this attempt",
+                                    "protocol_used": "", "output": ""}, extra, time.time())
+                    last_fail = "loop at %s (%s)" % (name, ip)
+                    break
+                visited.add(ip)
+                t0 = time.time()
+                hid = _new_hop(run_id, ip, name, extra)
+                res = trace_hop(ip, auth, protocol, mac)
+                extra.update(res["extra"])
+                _save_hop(hid, res, extra, t0)
+                hop_name = res["name"] or name or ip
+                if res["status"] in ("transit", "found"):
+                    last_seen = (hop_name, ip, extra.get("intf", ""), extra.get("vlan", ""))
+                if res["status"] == "found":
+                    summary = "Found: %s (%s) port %s, VLAN %s" % (hop_name, ip, extra["intf"], extra.get("vlan") or "-")
+                    return
+                if res["status"] != "transit":
+                    last_fail = "%s (%s): %s" % (hop_name, ip, res["error"] or res["status"])
+                    break
+                ip, name = extra["next_ip"], extra.get("next_name") or extra["next_ip"]
+            else:
+                hid = _new_hop(run_id, ip, name, {"attempt": attempt, "hop": max_hops + 1})
+                _save_hop(hid, {"name": "", "status": "cmd_error", "error": "Max hops reached (%d)" % max_hops,
+                                "protocol_used": "", "output": ""}, {"attempt": attempt, "hop": max_hops + 1}, time.time())
+                last_fail = "max hops reached (%d)" % max_hops
+        if last_seen:
+            summary = "Not located: last seen on %s (%s) %s, VLAN %s - then %s" % (
+                last_seen[0], last_seen[1], last_seen[2], last_seen[3] or "-", last_fail or "stopped")
+        else:
+            summary = "Not found from %d start switch(es)" % len(starts)
+    except Exception as exc:
+        summary = "Internal error: %s" % exc
+    finally:
+        with db_lock, db() as conn:
+            conn.execute("UPDATE runs SET finished=?, status='done', summary=? WHERE id=?", (now(), summary, run_id))
+
+
+# ---------------------------------------------------------------------------
 # Templates
 # ---------------------------------------------------------------------------
 BASE = """<!doctype html>
@@ -466,19 +767,19 @@ th{background:#f0f2f5;font-weight:600}
 .s-ok{color:var(--ok);font-weight:600}.s-cmd_error{color:var(--warn);font-weight:600}.s-conn_error{color:var(--err);font-weight:600}
 .s-potential_error{color:#8e44ad;font-weight:600}
 .s-pending,.s-running{color:var(--mut);font-weight:600}
+.s-found{color:var(--ok);font-weight:700}.s-transit{color:var(--acc);font-weight:600}.s-not_found{color:var(--warn);font-weight:600}
+.big{font-size:16px;font-weight:600}
 pre{background:#11161f;color:#d8dee9;padding:10px;border-radius:4px;overflow:auto;max-height:520px;margin:6px 0 0;font:12.5px/1.4 Consolas,monospace;white-space:pre}
 details summary{cursor:pointer}.mut{color:var(--mut)}.err{color:var(--err)}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
 .tag{background:#e3ecfb;color:#1f4f99;border-radius:10px;padding:0 7px;font-size:12px}
 </style></head><body>
-<header><span class="brand"><img src="{{ url_for('logo', v=logo_ver) }}" alt=""><b>NetCmd</b></span><a href="{{ url_for('index') }}">New run</a><a href="{{ url_for('history') }}">History</a><a href="{{ url_for('devices_page') }}">Devices</a><a class="right" href="{{ url_for('settings_page') }}">Settings</a></header>
+<header><span class="brand"><img src="{{ url_for('logo', v=logo_ver) }}" alt=""><b>NetCmd</b></span><a href="{{ url_for('index') }}">New run</a><a href="{{ url_for('history') }}">History</a><a href="{{ url_for('devices_page') }}">Devices</a><a href="{{ url_for('mactrace') }}">MAC Trace</a><a class="right" href="{{ url_for('settings_page') }}">Settings</a></header>
 <main>{{ body|safe }}</main></body></html>"""
 
-INDEX = """
-{% if error %}<div class="card err">{{ error }}</div>{% endif %}
-<form method="post" action="{{ url_for('start_run') }}" class="grid" autocomplete="off">
+DEVCARD = """
  <div class="card">
-  <div class="bar"><b>Devices</b><span class="mut">({{ devices|length }}, OS: {{ os_filter }})</span>
+  <div class="bar"><b>{{ devtitle }}</b><span class="mut">({{ devices|length }}, OS: {{ os_filter }})</span>
    <span id="cnt" class="mut"></span></div>
   <input type="text" id="flt" placeholder="Filter by name or IP">
   <div class="bar"><select id="grp" style="width:auto">
@@ -488,7 +789,7 @@ INDEX = """
   <div class="bar">
    <button type="button" class="sec" onclick="sel(true)">Select visible</button>
    <button type="button" class="sec" onclick="sel(false)">Clear visible</button>
-   <a class="btn sec" href="{{ url_for('index', refresh=1) }}">Reload list</a></div>
+   <a class="btn sec" href="{{ request.path }}?refresh=1">Reload list</a></div>
   <div class="devlist" id="dl">
    {% for d in devices %}
    <label data-k="{{ (d.name ~ ' ' ~ d.ip)|lower }}" data-n="{{ d.name|lower }}" data-ip="{{ d.ip }}" data-g="|{{ d.groups|join('|') }}|"><input type="checkbox" name="dev" value="{{ d.ip }}|{{ d.name }}">
@@ -498,20 +799,9 @@ INDEX = """
    {% endfor %}
   </div>
  </div>
- <div class="card">
-  <label>Login</label><input type="text" name="login" required>
-  <label>Password</label><input type="password" name="password" required>
-  <label style="font-weight:400"><input type="checkbox" name="enable_mode" value="1" checked> Enable mode (send 'enable' when the prompt ends with '&gt;')</label>
-  <label>Enable password (if empty, the login password is used)</label><input type="password" name="enable_password">
-  <label>Protocol</label>
-  <select name="protocol"><option value="auto">SSH, then Telnet if SSH fails</option>
-   <option value="ssh">SSH only</option><option value="telnet">Telnet only</option></select>
-  <label>Commands (one per line, sent as typed, in enable mode - an empty line sends Enter, e.g. to answer a [confirm] question)</label>
-  <textarea name="commands" required placeholder="show clock&#10;show version | include uptime"></textarea>
-  <div class="bar"><button type="submit">Run</button><span class="mut">Passwords are not stored.</span></div>
- </div>
-</form>
-<script>
+"""
+
+DEVJS = """<script>
 const f=document.getElementById('flt'),g=document.getElementById('grp'),rows=[...document.querySelectorAll('#dl label')],c=document.getElementById('cnt');
 function upd(){c.textContent=document.querySelectorAll('#dl input:checked').length+' selected'}
 function vis(){const q=f.value.toLowerCase(),gv=g.value;rows.forEach(r=>r.style.display=(r.dataset.k.includes(q)&&(!gv||r.dataset.g.includes('|'+gv+'|')))?'':'none')}
@@ -528,6 +818,27 @@ try{const pre=new URLSearchParams(location.search).getAll('ip');if(pre.length){l
  rows.forEach(r=>{if(pre.includes(r.dataset.ip)){r.querySelector('input').checked=true;if(!first)first=r}});upd();
  if(first)first.scrollIntoView({block:'center'})}}catch(e){}
 </script>"""
+
+AUTHFORM = """
+  <label>Login</label><input type="text" name="login" required>
+  <label>Password</label><input type="password" name="password" required>
+  <label style="font-weight:400"><input type="checkbox" name="enable_mode" value="1" checked> Enable mode (send 'enable' when the prompt ends with '&gt;')</label>
+  <label>Enable password (if empty, the login password is used)</label><input type="password" name="enable_password">
+  <label>Protocol</label>
+  <select name="protocol"><option value="auto">SSH, then Telnet if SSH fails</option>
+   <option value="ssh">SSH only</option><option value="telnet">Telnet only</option></select>
+"""
+
+INDEX = ("""
+{% if error %}<div class="card err">{{ error }}</div>{% endif %}
+<form method="post" action="{{ url_for('start_run') }}" class="grid" autocomplete="off">
+""" + DEVCARD + """ <div class="card">
+""" + AUTHFORM + """  <label>Commands (one per line, sent as typed, in enable mode - an empty line sends Enter, e.g. to answer a [confirm] question)</label>
+  <textarea name="commands" required placeholder="show clock&#10;show version | include uptime"></textarea>
+  <div class="bar"><button type="submit">Run</button><span class="mut">Passwords are not stored.</span></div>
+ </div>
+</form>
+""" + DEVJS)
 
 RUN = """
 <div class="card">
@@ -560,13 +871,67 @@ async function poll(){const r=await fetch('{{ url_for("api_run", run_id=run.id) 
 poll();
 </script>"""
 
+MACTRACE = ("""
+{% if error %}<div class="card err">{{ error }}</div>{% endif %}
+<form method="post" action="{{ url_for('mactrace') }}" class="grid" autocomplete="off">
+""" + DEVCARD + """ <div class="card">
+  <label>MAC address</label>
+  <input type="text" name="mac" required value="{{ mac }}" placeholder="0011.2233.4455 / 00:11:22:33:44:55 / 00-11-22-33-44-55 / 001122334455">
+""" + AUTHFORM + """  <label>Max hops per start switch</label><input type="text" name="max_hops" value="{{ max_hops }}" style="width:90px">
+  <div class="bar"><button type="submit">Trace</button><span class="mut">Passwords are not stored.</span></div>
+  <div class="mut" style="margin-top:8px">The selected start switches are tried one after the other (list order) until the MAC is located.
+   On each switch: <code>show mac address-table address &lt;mac&gt;</code>; when the port is a trunk with a CDP neighbor
+   (Port-channel: one of its members), the trace continues on the neighbor management IP, otherwise the port is the final port
+   (<code>show mac address-table interface</code> and the <code>show lldp neighbors</code> line of the port).
+   IP addresses are not accepted: ARP tables are per VRF.</div>
+ </div>
+</form>
+""" + DEVJS)
+
+MTRUN = """
+<div class="card">
+ <div class="bar"><b>MAC trace #{{ run.id }}</b><code class="big">{{ run.mac }}</code><span class="mut">{{ run.started }} - login {{ run.login }} - {{ run.protocol }} - enable {{ 'on' if run.enable_mode else 'off' }} - from {{ run.client_ip }}</span>
+  <span id="state" class="mut"></span>
+  <a class="btn sec" href="{{ url_for('export_run', run_id=run.id) }}">Export .txt</a>
+  <a class="btn sec" href="{{ url_for('mactrace', mac=run.mac) }}">New trace</a></div>
+ <div id="summary" class="big" style="margin-top:6px"></div>
+</div>
+<div class="card"><table><thead><tr><th>Try</th><th>Hop</th><th>Switch</th><th>IP</th><th>Result</th><th>Detail</th><th>Proto</th><th>Time</th></tr></thead>
+<tbody id="tb"></tbody></table></div>
+<script>
+const open=new Set();const lnms={{ lnms_url|tojson }};
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function dev(name,id){return id&&lnms?'<a href="'+esc(lnms)+'device/'+encodeURIComponent(id)+'" target="_blank" rel="noopener" title="Open in LibreNMS">'+esc(name)+'</a>':esc(name)}
+function draw(d){
+ let h='';d.results.forEach(r=>{const x=r.extra||{};const o=open.has(r.id)?' open':'';
+  let det=esc(r.error);
+  if(r.status==='transit'&&x.next_ip){det='VLAN '+esc(x.vlan||'-')+' - '+esc(x.intf)+(x.via&&x.via!==x.intf?' via '+esc(x.via):'')+' trunk to '+dev(x.next_name||x.next_ip,x.next_lnms_id)+' ('+esc(x.next_ip)+')'}
+  if(r.output)det='<details data-id="'+r.id+'"'+o+'><summary>'+det+'</summary><pre>'+esc(r.output)+'</pre></details>';
+  h+='<tr><td>'+esc(x.attempt)+'</td><td>'+esc(x.hop)+'</td><td>'+dev(r.name,r.lnms_id)+'</td><td class="mut">'+esc(r.ip)+'</td>'+
+   '<td class="s-'+r.status+'">'+r.status.replace('_',' ')+'</td><td>'+det+'</td><td>'+esc(r.protocol_used)+'</td><td>'+(r.duration!=null?r.duration+'s':'')+'</td></tr>'});
+ document.getElementById('tb').innerHTML=h;
+ document.querySelectorAll('#tb details').forEach(e=>e.addEventListener('toggle',()=>{const i=+e.dataset.id;e.open?open.add(i):open.delete(i)}));
+ const sm=document.getElementById('summary');const fin=d.results.find(r=>r.status==='found');
+ if(d.run.status==='done'){sm.className='big '+(fin?'s-found':'s-not_found');
+  sm.innerHTML=fin?'Found: '+dev(fin.name,fin.lnms_id)+' ('+esc(fin.ip)+') port '+esc((fin.extra||{}).intf)+', VLAN '+esc((fin.extra||{}).vlan||'-')+
+   ((fin.extra||{}).lldp?'<pre style="max-height:160px">'+esc(fin.extra.lldp)+'</pre>':''):esc(d.run.summary)}
+ else{sm.className='big mut';sm.textContent='Tracing...'}
+ document.getElementById('state').textContent=d.run.status==='done'?'finished '+d.run.finished:'running...';
+ return d.run.status==='done';
+}
+async function poll(){const r=await fetch('{{ url_for("api_run", run_id=run.id) }}');const d=await r.json();if(!draw(d))setTimeout(poll,1500)}
+poll();
+</script>"""
+
 HISTORY = """
 <div class="card"><div class="bar"><b>Runs</b><span class="mut">(last {{ runs|length }})</span></div>
-<table><thead><tr><th>#</th><th>Started</th><th>Login</th><th>From</th><th>Proto</th><th>Devices</th><th title="ok / potential error / command error / connection error">Results</th><th>Commands</th></tr></thead><tbody>
+<table><thead><tr><th>#</th><th>Started</th><th>Login</th><th>From</th><th>Proto</th><th>Devices</th><th title="ok / potential error / command error / connection error (MAC trace: result)">Results</th><th>Commands</th></tr></thead><tbody>
 {% for r in runs %}<tr><td><a href="{{ url_for('show_run', run_id=r.id) }}">{{ r.id }}</a></td><td>{{ r.started }}</td><td>{{ r.login }}</td>
 <td class="mut">{{ r.client_ip }}</td><td>{{ r.protocol }}</td><td>{{ r.device_count }}</td>
-<td><span class="s-ok">{{ r.ok }}</span> / <span class="s-potential_error">{{ r.pot }}</span> / <span class="s-cmd_error">{{ r.cmd }}</span> / <span class="s-conn_error">{{ r.conn }}</span>{% if r.status != 'done' %} <span class="mut">running</span>{% endif %}</td>
-<td><code>{{ r.commands.splitlines()[0] if r.commands else '' }}{% if r.commands and r.commands.splitlines()|length > 1 %} (+{{ r.commands.splitlines()|length - 1 }}){% endif %}</code></td></tr>
+{% if r.kind == 'mactrace' %}<td>{% if r.status != 'done' %}<span class="mut">running</span>{% else %}<span class="{{ 's-found' if (r.summary or '').startswith('Found') else 's-not_found' }}">{{ r.summary }}</span>{% endif %}</td>
+<td><b>MAC trace</b> <code>{{ r.commands }}</code></td></tr>
+{% else %}<td><span class="s-ok">{{ r.ok }}</span> / <span class="s-potential_error">{{ r.pot }}</span> / <span class="s-cmd_error">{{ r.cmd }}</span> / <span class="s-conn_error">{{ r.conn }}</span>{% if r.status != 'done' %} <span class="mut">running</span>{% endif %}</td>
+<td><code>{{ r.commands.splitlines()[0] if r.commands else '' }}{% if r.commands and r.commands.splitlines()|length > 1 %} (+{{ r.commands.splitlines()|length - 1 }}){% endif %}</code></td></tr>{% endif %}
 {% endfor %}</tbody></table></div>"""
 
 DEVICES = """
@@ -616,7 +981,65 @@ def index():
     devices, error = get_devices(force=bool(request.args.get("refresh")))
     st = get_settings()
     return page("New run", INDEX, devices=devices, error=error, os_filter=", ".join(OS_FILTER),
-                groups=_cache.get("groups", []), st=st, lnms_url=librenms_web_url(st))
+                groups=_cache.get("groups", []), st=st, lnms_url=librenms_web_url(st), devtitle="Devices")
+
+
+@app.route("/mactrace", methods=["GET", "POST"])
+def mactrace():
+    st = get_settings()
+    form_error = ""
+    mac_in = request.values.get("mac", "").strip()
+    max_hops = request.values.get("max_hops", str(TRACE_MAX_HOPS)).strip()
+    if request.method == "POST":
+        selected = request.form.getlist("dev")
+        login = request.form.get("login", "").strip()
+        password = request.form.get("password", "")
+        enable_mode = request.form.get("enable_mode") == "1"
+        enable_password = request.form.get("enable_password", "")
+        protocol = request.form.get("protocol", "auto")
+        if protocol not in ("auto", "ssh", "telnet"):
+            protocol = "auto"
+        mac = normalize_mac(mac_in)
+        try:
+            hops = max(1, min(60, int(max_hops)))
+        except ValueError:
+            hops = TRACE_MAX_HOPS
+        if not mac:
+            form_error = "Invalid MAC address: 12 hexadecimal digits expected (any separator)."
+        elif not selected or not login or not password:
+            form_error = "Select at least one start switch and fill login and password."
+        else:
+            starts = []
+            for sel in selected:
+                ip, _, name = sel.partition("|")
+                starts.append((ip.strip(), name.strip() or ip.strip()))
+            with db_lock, db() as conn:
+                cur = conn.execute(
+                    "INSERT INTO runs(started, client_ip, login, protocol, commands, device_count, status, enable_mode, kind) "
+                    "VALUES(?,?,?,?,?,?,?,?,'mactrace')",
+                    (now(), request.remote_addr, login, protocol, mac, len(starts), "running", 1 if enable_mode else 0),
+                )
+                run_id = cur.lastrowid
+            auth = {"user": login, "password": password, "enable_mode": enable_mode, "enable_password": enable_password}
+            threading.Thread(target=trace_job, args=(run_id, starts, auth, protocol, mac, hops), daemon=True).start()
+            return redirect(url_for("show_run", run_id=run_id))
+    devices, error = get_devices(force=bool(request.args.get("refresh")))
+    error = "\n".join(e for e in (form_error, error) if e)
+    return page("MAC Trace", MACTRACE, devices=devices, error=error, os_filter=", ".join(OS_FILTER),
+                groups=_cache.get("groups", []), st=st, lnms_url=librenms_web_url(st), devtitle="Start switches",
+                mac=mac_in, max_hops=max_hops), (400 if form_error else 200)
+
+
+def _short_name(name):
+    return re.split(r"[.(]", (name or "").strip().lower())[0]
+
+
+def lnms_ids():
+    """LibreNMS device id by IP and by short hostname (from the cached device list)."""
+    devices, _ = get_devices()
+    by_ip = {d["ip"]: d["id"] for d in devices if d.get("id")}
+    by_name = {_short_name(d["name"]): d["id"] for d in devices if d.get("id") and d.get("name")}
+    return lambda ip, name: by_ip.get(ip or "") or by_name.get(_short_name(name)) or ""
 
 
 @app.route("/logo")
@@ -728,25 +1151,63 @@ def _load_run(run_id):
         run = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if run is None:
             abort(404)
-        results = conn.execute("SELECT * FROM results WHERE run_id=? ORDER BY name", (run_id,)).fetchall()
-    return dict(run), [dict(r) for r in results]
+        order = "id" if run["kind"] == "mactrace" else "name"
+        results = conn.execute("SELECT * FROM results WHERE run_id=? ORDER BY " + order, (run_id,)).fetchall()
+    run = dict(run)
+    results = [dict(r) for r in results]
+    if run.get("kind") == "mactrace":
+        run["mac"] = run.get("commands") or ""
+        for r in results:
+            try:
+                r["extra"] = json.loads(r.get("extra") or "{}")
+            except ValueError:
+                r["extra"] = {}
+    return run, results
 
 
 @app.route("/run/<int:run_id>")
 def show_run(run_id):
     run, _ = _load_run(run_id)
+    if run.get("kind") == "mactrace":
+        st = get_settings()
+        lnms = librenms_web_url(st) if st.get("link_librenms") == "1" else ""
+        return page("MAC trace %d" % run_id, MTRUN, run=run, lnms_url=lnms)
     return page("Run %d" % run_id, RUN, run=run)
 
 
 @app.route("/api/run/<int:run_id>")
 def api_run(run_id):
     run, results = _load_run(run_id)
+    if run.get("kind") == "mactrace":
+        find = lnms_ids()
+        for r in results:
+            r["lnms_id"] = find(r["ip"], r["name"])
+            x = r["extra"]
+            if x.get("next_ip"):
+                x["next_lnms_id"] = find(x["next_ip"], x.get("next_name"))
     return jsonify(run=run, results=results)
 
 
 @app.route("/export/run/<int:run_id>.txt")
 def export_run(run_id):
     run, results = _load_run(run_id)
+    if run.get("kind") == "mactrace":
+        lines = [
+            "NetCmd MAC trace #%d - MAC %s - %s - login %s - protocol %s - from %s" % (
+                run["id"], run["mac"], run["started"], run["login"], run["protocol"], run["client_ip"]),
+            "Result: %s" % (run.get("summary") or run["status"]),
+            "",
+        ]
+        for r in results:
+            x = r["extra"]
+            lines.append("=" * 78)
+            lines.append("Try %s hop %s - %s (%s) - %s - %s - %s" % (
+                x.get("attempt", ""), x.get("hop", ""), r["name"], r["ip"], r["status"], r["error"] or "", r["protocol_used"] or ""))
+            lines.append("=" * 78)
+            lines.append(r["output"] or "")
+            lines.append("")
+        return Response("\n".join(lines), mimetype="text/plain",
+                        headers={"Content-Disposition": "attachment; filename=netcmd-mactrace-%d.txt" % run_id})
     lines = [
         "NetCmd run #%d - %s - login %s - protocol %s - from %s" % (run["id"], run["started"], run["login"], run["protocol"], run["client_ip"]),
         "Commands:",
@@ -799,6 +1260,7 @@ def mark_interrupted_runs():
     with db_lock, db() as conn:
         conn.execute("UPDATE results SET status='conn_error', error='Interrupted (service restart)' "
                      "WHERE status IN ('pending','running')")
+        conn.execute("UPDATE runs SET summary='Interrupted (service restart)' WHERE status='running' AND kind='mactrace'")
         conn.execute("UPDATE runs SET status='done', finished=? WHERE status='running'", (now(),))
 
 
