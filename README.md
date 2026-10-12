@@ -79,13 +79,24 @@ networks.
 - "Common first line" shown on every device, with placeholders `{ip}`, `{sysname}`, `{name}`, `{id}`.
 - Menu entry listing every device with notes.
 
-## About
+## License / Credits
 
 This software has been developed by Walyu PTE LTD - IT research department.
 <https://www.walyu.com> - Incorporated in Singapore.
 
 (C) Copyright 2026 Walyu PTE LTD
 
-## License
+Released under the GPL-3.0 license (see [LICENSE](LICENSE)), as LibreNMS.
 
-GPL-3.0 (see [LICENSE](LICENSE)), as LibreNMS.
+Built on and for:
+
+| Project | Use | License |
+|---|---|---|
+| [LibreNMS](https://www.librenms.org/) | Host application of the plugins, device inventory API | GPL-3.0-or-later |
+| [Netmiko](https://github.com/ktbyers/netmiko) | SSH / Telnet sessions to the devices (NetCmd) | MIT |
+| [Flask](https://flask.palletsprojects.com/) / [Waitress](https://docs.pylonsproject.org/projects/waitress/) | NetCmd web application and server | BSD-3-Clause / ZPL-2.1 |
+| [Requests](https://requests.readthedocs.io/) | NetCmd calls to the LibreNMS API | Apache-2.0 |
+| [Cisco PSIRT openVuln API](https://developer.cisco.com/docs/psirt/) | Security advisories (CiscoEox) | Cisco API terms of service |
+
+Cisco, IOS and Catalyst are trademarks of Cisco Systems, Inc. This project is not affiliated with
+or endorsed by Cisco or by the LibreNMS project.
