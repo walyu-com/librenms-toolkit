@@ -86,7 +86,7 @@ This software has been developed by Walyu PTE LTD - IT research department.
 
 (C) Copyright 2026 Walyu PTE LTD
 
-Released under the GPL-3.0 license (see [LICENSE](LICENSE)), as LibreNMS.
+Released under the Apache License 2.0 (see [LICENSE](LICENSE)).
 
 Built on and for:
 
