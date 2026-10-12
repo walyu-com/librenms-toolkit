@@ -40,7 +40,8 @@ sudo mv /opt/librenms/app/Plugins/<Name> /root/<Name>.removed
 ## NetCmd
 
 - Device list from the LibreNMS API (`/api/v0/devices`), filtered by OS (default `ios,iosxe`), with
-  LibreNMS device groups as filter, sort by name or IP, preselection with `/?ip=<address>`.
+  LibreNMS device groups as filter, sort by name or IP, preselection with `/?ip=<address>`;
+  Telnet, SSH and History links on each device.
 - Commands sent as typed with Netmiko, in parallel; `enable` handling (login password or a specific
   enable password).
 - Any device prompt (exec, config, config-xxx) ends a command; `[confirm]`, `[yes/no]` and
@@ -48,17 +49,23 @@ sudo mv /opt/librenms/app/Plugins/<Name> /root/<Name>.removed
   NetCmd never answers a question on its own.
 - Status per device: `ok`, `potential error` (lines starting with `%`), `cmd_error` (known IOS
   errors, timeout), `conn_error`.
+- Scripts: saved command sets (Scripts menu: add, edit, rename, delete), loaded on the New run page
+  from a drop-down list; "Save and Run" saves the commands under a script name, then runs them.
 - History in SQLite (runs, per-device outputs), text export. Passwords are never stored.
 - Settings page: links from device names to LibreNMS, `telnet://` and `ssh://` links, group badges,
-  custom logo (browser tab and title bar).
+  custom logo (browser tab and title bar), VRF discovery command and lookup field (MAC Trace).
 - MAC Trace page: locates the switch port of a MAC address (any notation). Start switches are chosen
   from the device list and tried in order. On each switch, `show mac address-table address <mac>`
   gives the port; when the port (or, for a Port-channel, one of its members) is a trunk with a CDP
   neighbor, the trace continues on the neighbor management IP; otherwise the port is the final port
   (`show mac address-table interface` and the `show lldp neighbors` line of the port). Every switch
-  traversed is linked to LibreNMS; traces are kept in the history with a text export. IP addresses
-  are not accepted as input: ARP tables are per VRF. Port of
+  traversed is linked to LibreNMS; traces are kept in the history with a text export. Port of
   [CiscoMacTrace](https://github.com/walyu-com/CiscoMacTrace).
+- MAC Trace by IP address: ARP lookup on a chosen gateway (L3 device). VRF field: only that VRF;
+  VRF empty with "Discover VRFs": global table, then every VRF listed by the discovery command
+  (Settings, default `show vrf brief`, VRF names read in the `Name` column); otherwise global
+  table only. An IP with several MACs (VRFs) is listed, not traced. An IP whose ARP entry is on
+  another device (e.g. a firewall) is reported as not found: use the MAC address.
 - Configuration: `/etc/netcmd/netcmd.env` (LibreNMS URL and API token, OS filter, timeouts, port).
 
 NetCmd has no authentication of its own: restrict access to port 8090 (firewall) to the admin

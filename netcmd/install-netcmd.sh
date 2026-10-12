@@ -33,6 +33,7 @@ MAC Trace   : hop-by-hop search of a MAC address (MAC table, trunk + CDP neighbo
               port of CiscoMacTrace (Walyu PTE LTD, Apache-2.0).
 """
 
+import ipaddress
 import json
 import os
 import re
@@ -140,6 +141,12 @@ def db_init():
                 k TEXT PRIMARY KEY,
                 v TEXT
             );
+            CREATE TABLE IF NOT EXISTS scripts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                body TEXT NOT NULL DEFAULT '',
+                updated TEXT
+            );
             """
         )
         cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()]
@@ -169,6 +176,8 @@ DEFAULT_SETTINGS = {
     "show_groups": "1",        # group (tag) badges in the device list
     "logo_ext": "",            # uploaded logo extension, empty = built-in logo
     "logo_ver": "0",           # changes on each upload (browser cache)
+    "vrf_cmd": "show vrf brief",  # MAC Trace, IP lookup: command listing the VRFs
+    "vrf_field": "Name",          # column of that command holding the VRF name
 }
 
 LOGO_TYPES = {
@@ -209,6 +218,36 @@ def save_settings(values):
 
 def logo_path(ext):
     return os.path.join(os.path.dirname(DB_PATH), "logo." + ext)
+
+
+def get_scripts():
+    with db() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM scripts ORDER BY name COLLATE NOCASE").fetchall()]
+
+
+def clean_body(text):
+    return "\n".join(l.rstrip() for l in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip("\n")
+
+
+def save_script(name, body, script_id=None):
+    """Create (script_id None) or update a script. Return an error string or ''."""
+    name = " ".join((name or "").split())
+    if not name:
+        return "Script name required."
+    if len(name) > 80:
+        return "Script name too long (80 characters max)."
+    with db_lock, db() as conn:
+        other = conn.execute("SELECT id FROM scripts WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+        if script_id is None:
+            if other:
+                conn.execute("UPDATE scripts SET body=?, updated=? WHERE id=?", (body, now(), other["id"]))
+            else:
+                conn.execute("INSERT INTO scripts(name, body, updated) VALUES(?,?,?)", (name, body, now()))
+        else:
+            if other and other["id"] != script_id:
+                return "Another script is already named '%s'." % name
+            conn.execute("UPDATE scripts SET name=?, body=?, updated=? WHERE id=?", (name, body, now(), script_id))
+    return ""
 
 
 def librenms_web_url(st):
@@ -707,6 +746,161 @@ def _save_hop(hop_id, res, extra, t0):
         )
 
 
+VRF_NAME_RE = re.compile(r"^[A-Za-z0-9_.:\-/]{1,64}$")
+ARP_LINE_RE = re.compile(r"^\s*Internet\s+(\d+\.\d+\.\d+\.\d+)\s+\S+\s+([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})\s+\S+\s*(\S*)")
+
+
+def is_ipv4(value):
+    try:
+        ipaddress.IPv4Address((value or "").strip())
+        return True
+    except ValueError:
+        return False
+
+
+def parse_vrf_list(output, field):
+    """
+    VRF names from a table output ('show vrf brief', 'show ip vrf', ...): the column whose
+    header is 'field' (case-insensitive); the value is the word starting in that column.
+    Continuation lines (empty column) are skipped.
+    """
+    lines = output.splitlines()
+    want = (field or "Name").strip().lower()
+    for i, ln in enumerate(lines):
+        pos = None
+        for m in re.finditer(r"\S+", ln):
+            if m.group(0).lower() == want:
+                pos = m.start()
+                break
+        if pos is None:
+            continue
+        names = []
+        for row in lines[i + 1:]:
+            if not row.strip() or set(row.strip()) <= set("-= "):
+                continue
+            if len(row) <= pos or (pos > 0 and not row[pos - 1].isspace()) or row[pos].isspace():
+                continue
+            name = row[pos:].split()[0]
+            if VRF_NAME_RE.match(name) and name not in names:
+                names.append(name)
+        return names
+    return []
+
+
+def parse_arp(output, ip):
+    """'show ip arp ...' -> [(mac, interface, line)] for this IP (incomplete entries ignored)."""
+    found = []
+    for ln in output.splitlines():
+        m = ARP_LINE_RE.match(ln)
+        if m and m.group(1) == ip:
+            found.append((m.group(2).lower(), m.group(3), ln.strip()))
+    return found
+
+
+def arp_lookup(gw_ip, auth, protocol, ip, vrf, discover, vrf_cmd, vrf_field):
+    """
+    ARP lookup of ip on the gateway.
+      vrf given          -> show ip arp vrf <vrf> <ip>
+      vrf empty+discover -> show ip arp <ip>, then the same in every VRF listed by vrf_cmd
+      vrf empty          -> show ip arp <ip> (global table only)
+    Return dict(status resolved|not_found|conn_error|cmd_error, error, name, protocol_used,
+                output, extra{macs:[{mac, vrf, intf}], vrfs})
+    """
+    res = {"status": "cmd_error", "error": "", "name": "", "protocol_used": "", "output": "", "extra": {}}
+    conn, proto, err = _connect_any(gw_ip, auth, protocol)
+    res["protocol_used"] = proto
+    if conn is None:
+        res.update(status="conn_error", error=err)
+        return res
+    parts = []
+    try:
+        res["name"] = (getattr(conn, "base_prompt", "") or "").strip()
+        try:
+            err = enter_enable(conn, auth, parts)
+        except ReadTimeout:
+            err = "Enable failed: no prompt received"
+        if err:
+            res.update(status="conn_error", error=err)
+            return res
+        prompt = conn.find_prompt().strip()
+        tables = []  # (vrf label, command)
+        if vrf:
+            tables.append((vrf, "show ip arp vrf %s %s" % (vrf, ip)))
+        else:
+            tables.append(("global", "show ip arp " + ip))
+            if discover:
+                vrfs = parse_vrf_list(_show(conn, vrf_cmd, prompt, parts), vrf_field)
+                res["extra"]["vrfs"] = vrfs
+                if not vrfs:
+                    parts.append("--- no VRF found in column '%s' of '%s' ---" % (vrf_field, vrf_cmd))
+                tables += [(v, "show ip arp vrf %s %s" % (v, ip)) for v in vrfs]
+        macs = []
+        for label, cmd in tables:
+            out = _show(conn, cmd, prompt, parts)
+            if any(m in out for m in ERR_MARKERS):
+                parts.append("--- command rejected, skipped ---")
+                continue
+            for mac, intf, _line in parse_arp(out, ip):
+                macs.append({"mac": mac, "vrf": label, "intf": intf})
+        res["extra"]["macs"] = macs
+        searched = ", ".join(t[0] for t in tables)
+        distinct = sorted({m["mac"] for m in macs})
+        if not macs:
+            res.update(status="not_found", error="%s not in the ARP table (%s)" % (ip, searched))
+        elif len(distinct) == 1:
+            res.update(status="resolved", error="%s = %s (%s)" % (
+                ip, distinct[0], ", ".join(sorted({m["vrf"] for m in macs}))))
+        else:
+            res.update(status="resolved", error="%s has %d different MACs: %s" % (
+                ip, len(distinct), ", ".join("%s (%s)" % (m["mac"], m["vrf"]) for m in macs)))
+        return res
+    except TraceError as exc:
+        res.update(status="cmd_error", error=str(exc))
+        return res
+    except Exception as exc:
+        res.update(status="conn_error", error="Session error: %s" % exc)
+        return res
+    finally:
+        res["output"] = "\n".join(parts)
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+
+def _finish(run_id, summary):
+    with db_lock, db() as conn:
+        conn.execute("UPDATE runs SET finished=?, status='done', summary=? WHERE id=?", (now(), summary, run_id))
+
+
+def trace_ip_job(run_id, starts, auth, protocol, lookup, max_hops):
+    """IP input: ARP lookup on the gateway, then the MAC trace (start: selected switches or the gateway)."""
+    try:
+        extra = {"attempt": 0, "hop": "ARP"}
+        t0 = time.time()
+        hid = _new_hop(run_id, lookup["gw_ip"], lookup["gw_name"], extra)
+        res = arp_lookup(lookup["gw_ip"], auth, protocol, lookup["ip"], lookup["vrf"], lookup["discover"],
+                         lookup["vrf_cmd"], lookup["vrf_field"])
+        extra.update(res["extra"])
+        _save_hop(hid, res, extra, t0)
+        if res["status"] != "resolved":
+            msg = res["error"] or res["status"]
+            if res["status"] == "not_found":
+                msg += " - not found, use the MAC address"
+            _finish(run_id, "IP lookup: " + msg)
+            return
+        distinct = sorted({m["mac"] for m in res["extra"]["macs"]})
+        if len(distinct) > 1:
+            _finish(run_id, "IP lookup: " + res["error"] + " - choose one and trace it by MAC")
+            return
+    except Exception as exc:
+        _finish(run_id, "Internal error: %s" % exc)
+        return
+    with db_lock, db() as conn:
+        conn.execute("UPDATE runs SET commands=? WHERE id=?", ("%s -> %s" % (lookup["ip"], distinct[0]), run_id))
+    trace_job(run_id, starts or [(lookup["gw_ip"], lookup["gw_name"])], auth, protocol, distinct[0], max_hops)
+
+
 def trace_job(run_id, starts, auth, protocol, mac, max_hops):
     """Try each start switch in order; stop at the first one that locates the MAC."""
     summary = ""
@@ -790,14 +984,14 @@ th{background:#f0f2f5;font-weight:600}
 .s-ok{color:var(--ok);font-weight:600}.s-cmd_error{color:var(--warn);font-weight:600}.s-conn_error{color:var(--err);font-weight:600}
 .s-potential_error{color:#8e44ad;font-weight:600}
 .s-pending,.s-running{color:var(--mut);font-weight:600}
-.s-found{color:var(--ok);font-weight:700}.s-transit{color:var(--acc);font-weight:600}.s-not_found{color:var(--warn);font-weight:600}
+.s-found{color:var(--ok);font-weight:700}.s-transit{color:var(--acc);font-weight:600}.s-not_found{color:var(--warn);font-weight:600}.s-resolved{color:var(--acc);font-weight:600}
 .big{font-size:16px;font-weight:600}
 pre{background:#11161f;color:#d8dee9;padding:10px;border-radius:4px;overflow:auto;max-height:520px;margin:6px 0 0;font:12.5px/1.4 Consolas,monospace;white-space:pre}
 details summary{cursor:pointer}.mut{color:var(--mut)}.err{color:var(--err)}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
 .tag{background:#e3ecfb;color:#1f4f99;border-radius:10px;padding:0 7px;font-size:12px}
 </style></head><body>
-<header><span class="brand"><img src="{{ url_for('logo', v=logo_ver) }}" alt=""><b>NetCmd</b></span><a href="{{ url_for('index') }}">New run</a><a href="{{ url_for('history') }}">History</a><a href="{{ url_for('devices_page') }}">Devices</a><a href="{{ url_for('mactrace') }}">MAC Trace</a><a class="right" href="{{ url_for('settings_page') }}">Settings</a></header>
+<header><span class="brand"><img src="{{ url_for('logo', v=logo_ver) }}" alt=""><b>NetCmd</b></span><a href="{{ url_for('index') }}">New run</a><a href="{{ url_for('scripts_page') }}">Scripts</a><a href="{{ url_for('history') }}">History</a><a href="{{ url_for('devices_page') }}">Devices</a><a href="{{ url_for('mactrace') }}">MAC Trace</a><a class="right" href="{{ url_for('settings_page') }}">Settings</a></header>
 <main>{{ body|safe }}</main></body></html>"""
 
 DEVCARD = """
@@ -818,7 +1012,7 @@ DEVCARD = """
    <label data-k="{{ (d.name ~ ' ' ~ d.ip)|lower }}" data-n="{{ d.name|lower }}" data-ip="{{ d.ip }}" data-g="|{{ d.groups|join('|') }}|"><input type="checkbox" name="dev" value="{{ d.ip }}|{{ d.name }}">
     {% if st.link_librenms == '1' and d.id %}<a class="dname" href="{{ lnms_url }}device/{{ d.id }}" target="_blank" rel="noopener" title="Open in LibreNMS">{{ d.name }}</a>{% else %}<span>{{ d.name }}</span>{% endif %}
     {% if st.show_groups == '1' %}{% for g in d.groups %}<span class="tag">{{ g }}</span>{% endfor %}{% endif %}{% if not d.up %}<span class="err">down</span>{% endif %}<span class="ip">{{ d.ip }}</span>
-    {% if st.link_telnet == '1' %}<a class="cli" href="telnet://{{ d.ip }}" title="Telnet {{ d.ip }}">Telnet</a>{% endif %}{% if st.link_ssh == '1' %}<a class="cli" href="ssh://{{ d.ip }}" title="SSH {{ d.ip }}">SSH</a>{% endif %}</label>
+    {% if st.link_telnet == '1' %}<a class="cli" href="telnet://{{ d.ip }}" title="Telnet {{ d.ip }}">Telnet</a>{% endif %}{% if st.link_ssh == '1' %}<a class="cli" href="ssh://{{ d.ip }}" title="SSH {{ d.ip }}">SSH</a>{% endif %}<a class="cli" href="{{ url_for('devices_page', ip=d.ip) }}" title="NetCmd history of {{ d.name }}">History</a></label>
    {% endfor %}
   </div>
  </div>
@@ -857,11 +1051,23 @@ INDEX = ("""
 <form method="post" action="{{ url_for('start_run') }}" class="grid" autocomplete="off">
 """ + DEVCARD + """ <div class="card">
 """ + AUTHFORM + """  <label>Commands (one per line, sent as typed, in enable mode - an empty line sends Enter, e.g. to answer a [confirm] question)</label>
-  <textarea name="commands" required placeholder="show clock&#10;show version | include uptime"></textarea>
-  <div class="bar"><button type="submit">Run</button><span class="mut">Passwords are not stored.</span></div>
+  <div class="bar"><select id="scr" style="width:auto;min-width:260px"><option value="">-- load a saved script --</option>
+   {% for sc in scripts %}<option value="{{ sc.id }}" {% if sc.id == script_id %}selected{% endif %}>{{ sc.name }}</option>{% endfor %}</select>
+   <a class="mut" href="{{ url_for('scripts_page') }}">Manage scripts</a></div>
+  <textarea name="commands" id="cmds" required placeholder="show clock&#10;show version | include uptime">{{ commands }}</textarea>
+  <div class="bar"><button type="submit" name="action" value="run">Run</button>
+   <input type="text" name="script_name" id="scrname" value="{{ script_name }}" placeholder="Script name" style="width:220px">
+   <button type="submit" name="action" value="saverun" class="sec">Save and Run</button>
+   <span class="mut">Passwords are not stored.</span></div>
+  <div class="mut">Save and Run: saves the commands as a script (a script with the same name is replaced), then runs them.</div>
  </div>
 </form>
-""" + DEVJS)
+""" + DEVJS + """
+<script>
+const SCRIPTS={{ scripts_json|safe }};
+document.getElementById('scr').addEventListener('change',e=>{const sc=SCRIPTS[e.target.value];
+ if(sc){document.getElementById('cmds').value=sc.body;document.getElementById('scrname').value=sc.name}});
+</script>""")
 
 RUN = """
 <div class="card">
@@ -898,15 +1104,24 @@ MACTRACE = ("""
 {% if error %}<div class="card err">{{ error }}</div>{% endif %}
 <form method="post" action="{{ url_for('mactrace') }}" class="grid" autocomplete="off">
 """ + DEVCARD + """ <div class="card">
-  <label>MAC address</label>
-  <input type="text" name="mac" required value="{{ mac }}" placeholder="0011.2233.4455 / 00:11:22:33:44:55 / 00-11-22-33-44-55 / 001122334455">
+  <label>MAC address or IP address</label>
+  <input type="text" name="mac" required value="{{ mac }}" placeholder="0011.2233.4455 / 00:11:22:33:44:55 / 001122334455 / 192.0.2.25">
+  <fieldset style="border:1px solid var(--line);border-radius:4px;margin:10px 0;padding:4px 10px 10px">
+   <legend class="mut">IP address only: ARP lookup</legend>
+   <label>Gateway (L3 device holding the ARP table)</label>
+   <select name="gw"><option value="">-- choose --</option>
+    {% for d in devices %}<option value="{{ d.ip }}|{{ d.name }}" {% if gw == d.ip ~ '|' ~ d.name %}selected{% endif %}>{{ d.name }} ({{ d.ip }})</option>{% endfor %}</select>
+   <label>VRF (empty = global table)</label><input type="text" name="vrf" value="{{ vrf }}" placeholder="e.g. USERS">
+   <label style="font-weight:400"><input type="checkbox" name="vrf_discover" value="1" {{ 'checked' if vrf_discover == '1' }}> Discover VRFs (VRF empty: global table, then every VRF listed by <code>{{ st.vrf_cmd }}</code>)</label>
+   <div class="mut">No start switch selected: the trace starts on the gateway. An address not in the gateway ARP table
+    (e.g. a gateway on another firewall or router) is reported as not found: use the MAC address.</div>
+  </fieldset>
 """ + AUTHFORM + """  <label>Max hops per start switch</label><input type="text" name="max_hops" value="{{ max_hops }}" style="width:90px">
   <div class="bar"><button type="submit">Trace</button><span class="mut">Passwords are not stored.</span></div>
   <div class="mut" style="margin-top:8px">The selected start switches are tried one after the other (list order) until the MAC is located.
    On each switch: <code>show mac address-table address &lt;mac&gt;</code>; when the port is a trunk with a CDP neighbor
    (Port-channel: one of its members), the trace continues on the neighbor management IP, otherwise the port is the final port
-   (<code>show mac address-table interface</code> and the <code>show lldp neighbors</code> line of the port).
-   IP addresses are not accepted: ARP tables are per VRF.</div>
+   (<code>show mac address-table interface</code> and the <code>show lldp neighbors</code> line of the port).</div>
  </div>
 </form>
 """ + DEVJS)
@@ -916,7 +1131,7 @@ MTRUN = """
  <div class="bar"><b>MAC trace #{{ run.id }}</b><code class="big">{{ run.mac }}</code><span class="mut">{{ run.started }} - login {{ run.login }} - {{ run.protocol }} - enable {{ 'on' if run.enable_mode else 'off' }} - from {{ run.client_ip }}</span>
   <span id="state" class="mut"></span>
   <a class="btn sec" href="{{ url_for('export_run', run_id=run.id) }}">Export .txt</a>
-  <a class="btn sec" href="{{ url_for('mactrace', mac=run.mac) }}">New trace</a></div>
+  <a class="btn sec" href="{{ url_for('mactrace', mac=run.input) }}">New trace</a></div>
  <div id="summary" class="big" style="margin-top:6px"></div>
 </div>
 <div class="card"><table><thead><tr><th>Try</th><th>Hop</th><th>Switch</th><th>IP</th><th>Result</th><th>Detail</th><th>Proto</th><th>Time</th></tr></thead>
@@ -928,6 +1143,7 @@ function dev(name,id){return id&&lnms?'<a href="'+esc(lnms)+'device/'+encodeURIC
 function draw(d){
  let h='';d.results.forEach(r=>{const x=r.extra||{};const o=open.has(r.id)?' open':'';
   let det=esc(r.error);
+  if(r.status==='resolved'&&x.macs&&x.macs.length){det=esc(r.error)+'<br>'+x.macs.map(m=>'<a href="{{ url_for("mactrace") }}?mac='+encodeURIComponent(m.mac)+'">Trace '+esc(m.mac)+'</a> <span class="mut">('+esc(m.vrf)+(m.intf?', '+esc(m.intf):'')+')</span>').join(' &nbsp; ')}
   if(r.status==='transit'&&x.next_ip){det='VLAN '+esc(x.vlan||'-')+' - '+esc(x.intf)+(x.via&&x.via!==x.intf?' via '+esc(x.via):'')+' trunk to '+dev(x.next_name||x.next_ip,x.next_lnms_id)+' ('+esc(x.next_ip)+')'}
   if(r.output)det='<details data-id="'+r.id+'"'+o+'><summary>'+det+'</summary><pre>'+esc(r.output)+'</pre></details>';
   h+='<tr><td>'+esc(x.attempt)+'</td><td>'+esc(x.hop)+'</td><td>'+dev(r.name,r.lnms_id)+'</td><td class="mut">'+esc(r.ip)+'</td>'+
@@ -945,6 +1161,31 @@ function draw(d){
 async function poll(){const r=await fetch('{{ url_for("api_run", run_id=run.id) }}');const d=await r.json();if(!draw(d))setTimeout(poll,1500)}
 poll();
 </script>"""
+
+SCRIPTS = """
+{% if msg %}<div class="card {{ 'err' if err else '' }}">{{ msg }}</div>{% endif %}
+<div class="card"><div class="bar"><b>Scripts</b><span class="mut">({{ scripts|length }})</span>
+ <a class="btn" href="{{ url_for('script_edit', script_id=0) }}">New script</a></div>
+<table><thead><tr><th>Name</th><th>Commands</th><th>Updated</th><th></th></tr></thead><tbody>
+{% for sc in scripts %}<tr><td><a href="{{ url_for('script_edit', script_id=sc.id) }}">{{ sc.name }}</a></td>
+<td><details><summary><code>{{ sc.body.splitlines()[0] if sc.body else '' }}</code>{% if sc.body.splitlines()|length > 1 %} <span class="mut">(+{{ sc.body.splitlines()|length - 1 }} lines)</span>{% endif %}</summary><pre>{{ sc.body }}</pre></details></td>
+<td class="mut">{{ sc.updated }}</td>
+<td style="white-space:nowrap"><a class="btn sec" href="{{ url_for('index', script=sc.id) }}">Use in New run</a>
+ <a class="btn sec" href="{{ url_for('script_edit', script_id=sc.id) }}">Edit / rename</a>
+ <form method="post" action="{{ url_for('script_delete', script_id=sc.id) }}" style="display:inline" data-name="{{ sc.name }}" onsubmit="return confirm('Delete script ' + this.dataset.name + ' ?')">
+  <button type="submit" class="sec" style="color:var(--err)">Delete</button></form></td></tr>
+{% else %}<tr><td colspan="4" class="mut">No script yet. Create one here, or use "Save and Run" on the New run page.</td></tr>{% endfor %}
+</tbody></table></div>"""
+
+SCRIPT_EDIT = """
+{% if msg %}<div class="card err">{{ msg }}</div>{% endif %}
+<form method="post" class="card" style="max-width:900px" autocomplete="off">
+ <div class="bar"><b>{{ 'Edit script' if script_id else 'New script' }}</b></div>
+ <label>Name</label><input type="text" name="name" value="{{ name }}" required maxlength="80">
+ <label>Commands (one per line, sent as typed - an empty line sends Enter)</label>
+ <textarea name="body" required>{{ body }}</textarea>
+ <div class="bar"><button type="submit">Save</button><a class="btn sec" href="{{ url_for('scripts_page') }}">Cancel</a></div>
+</form>"""
 
 HISTORY = """
 <div class="card"><div class="bar"><b>Runs</b><span class="mut">(last {{ runs|length }})</span></div>
@@ -980,6 +1221,12 @@ SETTINGS = """
  <label style="font-weight:400"><input type="checkbox" name="link_telnet" value="1" {{ 'checked' if st.link_telnet == '1' }}> Telnet link right of the device IP (telnet://)</label>
  <label style="font-weight:400"><input type="checkbox" name="link_ssh" value="1" {{ 'checked' if st.link_ssh == '1' }}> SSH link right of the device IP (ssh://)</label>
  <label style="font-weight:400"><input type="checkbox" name="show_groups" value="1" {{ 'checked' if st.show_groups == '1' }}> Display group in device list</label>
+ <div class="bar" style="margin-top:14px"><b>MAC Trace - VRF discovery</b></div>
+ <label>Command listing the VRFs</label>
+ <input type="text" name="vrf_cmd" value="{{ st.vrf_cmd }}" placeholder="show vrf brief">
+ <label>Lookup field (column header holding the VRF name)</label>
+ <input type="text" name="vrf_field" value="{{ st.vrf_field }}" placeholder="Name" style="max-width:240px">
+ <div class="mut">Defaults: <code>show vrf brief</code> / <code>Name</code>. Example for older IOS: <code>show ip vrf</code> / <code>Name</code>.</div>
  <label>Logo (square image, shown in the browser tab and left of the NetCmd title)</label>
  <div class="bar"><img src="{{ url_for('logo', v=logo_ver) }}" alt="" style="width:48px;height:48px;object-fit:contain;border:1px solid var(--line);border-radius:6px">
   <span class="mut">{{ 'Custom logo' if st.logo_ext else 'Built-in logo' }}</span></div>
@@ -1003,8 +1250,59 @@ def page(title, tpl, **ctx):
 def index():
     devices, error = get_devices(force=bool(request.args.get("refresh")))
     st = get_settings()
+    scripts = get_scripts()
+    script_id, commands, script_name = None, "", ""
+    try:
+        sid = int(request.args.get("script", "0"))
+    except ValueError:
+        sid = 0
+    for sc in scripts:
+        if sc["id"] == sid:
+            script_id, commands, script_name = sc["id"], sc["body"], sc["name"]
+    scripts_json = json.dumps({str(sc["id"]): {"name": sc["name"], "body": sc["body"]} for sc in scripts}).replace("<", "\\u003c")
     return page("New run", INDEX, devices=devices, error=error, os_filter=", ".join(OS_FILTER),
-                groups=_cache.get("groups", []), st=st, lnms_url=librenms_web_url(st), devtitle="Devices")
+                groups=_cache.get("groups", []), st=st, lnms_url=librenms_web_url(st), devtitle="Devices",
+                scripts=scripts, scripts_json=scripts_json, script_id=script_id, commands=commands,
+                script_name=script_name)
+
+
+@app.route("/scripts")
+def scripts_page():
+    msg = {"saved": "Script saved.", "deleted": "Script deleted."}.get(request.args.get("m", ""), "")
+    return page("Scripts", SCRIPTS, scripts=get_scripts(), msg=msg, err=False)
+
+
+@app.route("/scripts/<int:script_id>", methods=["GET", "POST"])
+def script_edit(script_id):
+    msg = ""
+    if script_id:
+        with db() as conn:
+            row = conn.execute("SELECT * FROM scripts WHERE id=?", (script_id,)).fetchone()
+        if row is None:
+            abort(404)
+        name, body = row["name"], row["body"]
+    else:
+        name, body = "", ""
+    if request.method == "POST":
+        name, body = request.form.get("name", ""), clean_body(request.form.get("body", ""))
+        if not body.strip():
+            msg = "Commands required."
+        elif script_id:
+            msg = save_script(name, body, script_id)
+        else:
+            with db() as conn:
+                exists = conn.execute("SELECT 1 FROM scripts WHERE name=? COLLATE NOCASE", (" ".join(name.split()),)).fetchone()
+            msg = ("A script is already named '%s'." % name) if exists else save_script(name, body)
+        if not msg:
+            return redirect(url_for("scripts_page", m="saved"))
+    return page("Scripts", SCRIPT_EDIT, script_id=script_id, name=name, body=body, msg=msg)
+
+
+@app.route("/scripts/<int:script_id>/delete", methods=["POST"])
+def script_delete(script_id):
+    with db_lock, db() as conn:
+        conn.execute("DELETE FROM scripts WHERE id=?", (script_id,))
+    return redirect(url_for("scripts_page", m="deleted"))
 
 
 @app.route("/mactrace", methods=["GET", "POST"])
@@ -1023,34 +1321,54 @@ def mactrace():
         if protocol not in ("auto", "ssh", "telnet"):
             protocol = "auto"
         mac = normalize_mac(mac_in)
+        target_ip = mac_in if (not mac and is_ipv4(mac_in)) else ""
+        gw_ip, _, gw_name = request.form.get("gw", "").partition("|")
+        vrf = request.form.get("vrf", "").strip()
+        discover = request.form.get("vrf_discover") == "1"
         try:
             hops = max(1, min(60, int(max_hops)))
         except ValueError:
             hops = TRACE_MAX_HOPS
-        if not mac:
-            form_error = "Invalid MAC address: 12 hexadecimal digits expected (any separator)."
-        elif not selected or not login or not password:
-            form_error = "Select at least one start switch and fill login and password."
+        starts = []
+        for sel in selected:
+            ip, _, name = sel.partition("|")
+            starts.append((ip.strip(), name.strip() or ip.strip()))
+        if not mac and not target_ip:
+            form_error = "Invalid input: MAC address (12 hexadecimal digits, any separator) or IPv4 address expected."
+        elif not login or not password:
+            form_error = "Fill login and password."
+        elif mac and not starts:
+            form_error = "Select at least one start switch."
+        elif target_ip and not gw_ip.strip():
+            form_error = "IP address: choose the gateway (L3 device) holding the ARP table."
+        elif vrf and not VRF_NAME_RE.match(vrf):
+            form_error = "Invalid VRF name."
         else:
-            starts = []
-            for sel in selected:
-                ip, _, name = sel.partition("|")
-                starts.append((ip.strip(), name.strip() or ip.strip()))
             with db_lock, db() as conn:
                 cur = conn.execute(
                     "INSERT INTO runs(started, client_ip, login, protocol, commands, device_count, status, enable_mode, kind) "
                     "VALUES(?,?,?,?,?,?,?,?,'mactrace')",
-                    (now(), request.remote_addr, login, protocol, mac, len(starts), "running", 1 if enable_mode else 0),
+                    (now(), request.remote_addr, login, protocol, mac or target_ip, len(starts) or 1, "running",
+                     1 if enable_mode else 0),
                 )
                 run_id = cur.lastrowid
             auth = {"user": login, "password": password, "enable_mode": enable_mode, "enable_password": enable_password}
-            threading.Thread(target=trace_job, args=(run_id, starts, auth, protocol, mac, hops), daemon=True).start()
+            if mac:
+                threading.Thread(target=trace_job, args=(run_id, starts, auth, protocol, mac, hops), daemon=True).start()
+            else:
+                lookup = {"ip": target_ip, "gw_ip": gw_ip.strip(), "gw_name": gw_name.strip() or gw_ip.strip(),
+                          "vrf": vrf, "discover": discover and not vrf,
+                          "vrf_cmd": (st.get("vrf_cmd") or DEFAULT_SETTINGS["vrf_cmd"]).strip(),
+                          "vrf_field": (st.get("vrf_field") or DEFAULT_SETTINGS["vrf_field"]).strip()}
+                threading.Thread(target=trace_ip_job, args=(run_id, starts, auth, protocol, lookup, hops),
+                                 daemon=True).start()
             return redirect(url_for("show_run", run_id=run_id))
     devices, error = get_devices(force=bool(request.args.get("refresh")))
     error = "\n".join(e for e in (form_error, error) if e)
     return page("MAC Trace", MACTRACE, devices=devices, error=error, os_filter=", ".join(OS_FILTER),
                 groups=_cache.get("groups", []), st=st, lnms_url=librenms_web_url(st), devtitle="Start switches",
-                mac=mac_in, max_hops=max_hops), (400 if form_error else 200)
+                mac=mac_in, max_hops=max_hops, gw=request.values.get("gw", ""), vrf=request.values.get("vrf", ""),
+                vrf_discover=request.values.get("vrf_discover", "")), (400 if form_error else 200)
 
 
 def _short_name(name):
@@ -1088,6 +1406,9 @@ def settings_page():
         values = {k: ("1" if request.form.get(k) == "1" else "0")
                   for k in ("link_librenms", "link_telnet", "link_ssh", "show_groups")}
         values["librenms_web_url"] = request.form.get("librenms_web_url", "").strip()
+        for k in ("vrf_cmd", "vrf_field"):
+            v = " ".join(request.form.get(k, "").split())  # single line
+            values[k] = v or DEFAULT_SETTINGS[k]
         st = get_settings()
         if request.form.get("logo_reset") == "1" and st.get("logo_ext"):
             try:
@@ -1147,6 +1468,10 @@ def start_run():
         protocol = "auto"
     if not selected or not login or not password or not commands:
         return page("Error", "<div class='card err'>Select at least one device and fill login, password and commands.</div>"), 400
+    if request.form.get("action") == "saverun":
+        err = save_script(request.form.get("script_name", ""), "\n".join(commands))
+        if err:
+            return page("Error", "<div class='card err'>Script not saved, nothing run: {{ e }}</div>", e=err), 400
 
     targets = []
     for s in selected:
@@ -1180,6 +1505,7 @@ def _load_run(run_id):
     results = [dict(r) for r in results]
     if run.get("kind") == "mactrace":
         run["mac"] = run.get("commands") or ""
+        run["input"] = run["mac"].split(" -> ")[0]
         for r in results:
             try:
                 r["extra"] = json.loads(r.get("extra") or "{}")
@@ -1216,7 +1542,7 @@ def export_run(run_id):
     run, results = _load_run(run_id)
     if run.get("kind") == "mactrace":
         lines = [
-            "NetCmd MAC trace #%d - MAC %s - %s - login %s - protocol %s - from %s" % (
+            "NetCmd MAC trace #%d - %s - %s - login %s - protocol %s - from %s" % (
                 run["id"], run["mac"], run["started"], run["login"], run["protocol"], run["client_ip"]),
             "Result: %s" % (run.get("summary") or run["status"]),
             "",
