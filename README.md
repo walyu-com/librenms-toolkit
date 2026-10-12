@@ -1,5 +1,7 @@
 # librenms-toolkit
 
+*Developed by [Walyu PTE LTD](https://www.walyu.com) - IT research department.*
+
 Companion tools for a [LibreNMS](https://www.librenms.org/) server managing Cisco switches:
 
 | Component | Type | Purpose |
@@ -76,6 +78,13 @@ networks.
 - Inline editor (saved through the LibreNMS notes route and permissions), configurable height.
 - "Common first line" shown on every device, with placeholders `{ip}`, `{sysname}`, `{name}`, `{id}`.
 - Menu entry listing every device with notes.
+
+## About
+
+This software has been developed by Walyu PTE LTD - IT research department.
+<https://www.walyu.com> - Incorporated in Singapore.
+
+(C) Copyright 2026 Walyu PTE LTD
 
 ## License
 
