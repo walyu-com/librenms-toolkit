@@ -145,7 +145,9 @@ def db_init():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 body TEXT NOT NULL DEFAULT '',
-                updated TEXT
+                updated TEXT,
+                description TEXT NOT NULL DEFAULT '',
+                created TEXT
             );
             """
         )
@@ -156,6 +158,12 @@ def db_init():
             conn.execute("ALTER TABLE runs ADD COLUMN kind TEXT DEFAULT 'cmd'")
         if "summary" not in cols:
             conn.execute("ALTER TABLE runs ADD COLUMN summary TEXT")
+        scols = [r[1] for r in conn.execute("PRAGMA table_info(scripts)").fetchall()]
+        if "description" not in scols:
+            conn.execute("ALTER TABLE scripts ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        if "created" not in scols:
+            conn.execute("ALTER TABLE scripts ADD COLUMN created TEXT")
+            conn.execute("UPDATE scripts SET created=updated")
         rcols = [r[1] for r in conn.execute("PRAGMA table_info(results)").fetchall()]
         if "extra" not in rcols:  # MAC trace hop details (JSON)
             conn.execute("ALTER TABLE results ADD COLUMN extra TEXT")
@@ -229,25 +237,44 @@ def clean_body(text):
     return "\n".join(l.rstrip() for l in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")).strip("\n")
 
 
-def save_script(name, body, script_id=None):
-    """Create (script_id None) or update a script. Return an error string or ''."""
+def free_script_name(conn, name, exclude_id=None):
+    """name if unused, otherwise 'name (2)', 'name (3)', ... (case-insensitive)."""
+    def used(n):
+        row = conn.execute("SELECT id FROM scripts WHERE name=? COLLATE NOCASE", (n,)).fetchone()
+        return row is not None and row["id"] != exclude_id
+    if not used(name):
+        return name
+    base = re.sub(r"\s\(\d+\)$", "", name)
+    i = 2
+    while used("%s (%d)" % (base, i)):
+        i += 1
+    return "%s (%d)" % (base, i)
+
+
+def save_script(name, body, script_id=None, description=None, dedup=False):
+    """
+    Create (script_id None) or update a script. Return (error, saved name).
+    dedup=True (Save and Run): an existing name gets an index, 'name (2)'.
+    """
     name = " ".join((name or "").split())
     if not name:
-        return "Script name required."
+        return "Script name required.", ""
     if len(name) > 80:
-        return "Script name too long (80 characters max)."
+        return "Script name too long (80 characters max).", ""
+    description = (description or "").strip()[:2000]
     with db_lock, db() as conn:
+        if dedup:
+            name = free_script_name(conn, name)
         other = conn.execute("SELECT id FROM scripts WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+        if other and other["id"] != script_id:
+            return "A script is already named '%s'." % name, ""
         if script_id is None:
-            if other:
-                conn.execute("UPDATE scripts SET body=?, updated=? WHERE id=?", (body, now(), other["id"]))
-            else:
-                conn.execute("INSERT INTO scripts(name, body, updated) VALUES(?,?,?)", (name, body, now()))
+            conn.execute("INSERT INTO scripts(name, body, description, created, updated) VALUES(?,?,?,?,?)",
+                         (name, body, description, now(), now()))
         else:
-            if other and other["id"] != script_id:
-                return "Another script is already named '%s'." % name
-            conn.execute("UPDATE scripts SET name=?, body=?, updated=? WHERE id=?", (name, body, now(), script_id))
-    return ""
+            conn.execute("UPDATE scripts SET name=?, body=?, description=?, updated=? WHERE id=?",
+                         (name, body, description, now(), script_id))
+    return "", name
 
 
 def librenms_web_url(st):
@@ -846,13 +873,13 @@ def arp_lookup(gw_ip, auth, protocol, ip, vrf, discover, vrf_cmd, vrf_field):
         searched = ", ".join(t[0] for t in tables)
         distinct = sorted({m["mac"] for m in macs})
         if not macs:
-            res.update(status="not_found", error="%s not in the ARP table (%s)" % (ip, searched))
+            res.update(status="not_found", error="%s not in the ARP table (VRF=%s)" % (ip, searched))
         elif len(distinct) == 1:
-            res.update(status="resolved", error="%s = %s (%s)" % (
+            res.update(status="resolved", error="%s = %s, VRF=%s" % (
                 ip, distinct[0], ", ".join(sorted({m["vrf"] for m in macs}))))
         else:
             res.update(status="resolved", error="%s has %d different MACs: %s" % (
-                ip, len(distinct), ", ".join("%s (%s)" % (m["mac"], m["vrf"]) for m in macs)))
+                ip, len(distinct), ", ".join("%s VRF=%s" % (m["mac"], m["vrf"]) for m in macs)))
         return res
     except TraceError as exc:
         res.update(status="cmd_error", error=str(exc))
@@ -990,6 +1017,9 @@ pre{background:#11161f;color:#d8dee9;padding:10px;border-radius:4px;overflow:aut
 details summary{cursor:pointer}.mut{color:var(--mut)}.err{color:var(--err)}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
 .tag{background:#e3ecfb;color:#1f4f99;border-radius:10px;padding:0 7px;font-size:12px}
+button:disabled{opacity:.55;cursor:not-allowed}
+.picker{position:absolute;left:0;right:0;top:100%;z-index:20;background:#fff;border:1px solid var(--line);border-radius:4px;max-height:320px;overflow:auto;box-shadow:0 4px 14px rgba(0,0,0,.12)}
+.picker>div{padding:5px 9px;border-bottom:1px solid #eef0f3}.picker .it{cursor:pointer}.picker .it:hover,.picker .it.on{background:#e3ecfb}
 </style></head><body>
 <header><span class="brand"><img src="{{ url_for('logo', v=logo_ver) }}" alt=""><b>NetCmd</b></span><a href="{{ url_for('index') }}">New run</a><a href="{{ url_for('scripts_page') }}">Scripts</a><a href="{{ url_for('history') }}">History</a><a href="{{ url_for('devices_page') }}">Devices</a><a href="{{ url_for('mactrace') }}">MAC Trace</a><a class="right" href="{{ url_for('settings_page') }}">Settings</a></header>
 <main>{{ body|safe }}</main></body></html>"""
@@ -1051,22 +1081,49 @@ INDEX = ("""
 <form method="post" action="{{ url_for('start_run') }}" class="grid" autocomplete="off">
 """ + DEVCARD + """ <div class="card">
 """ + AUTHFORM + """  <label>Commands (one per line, sent as typed, in enable mode - an empty line sends Enter, e.g. to answer a [confirm] question)</label>
-  <div class="bar"><select id="scr" style="width:auto;min-width:260px"><option value="">-- load a saved script --</option>
-   {% for sc in scripts %}<option value="{{ sc.id }}" {% if sc.id == script_id %}selected{% endif %}>{{ sc.name }}</option>{% endfor %}</select>
-   <a class="mut" href="{{ url_for('scripts_page') }}">Manage scripts</a></div>
+  <div class="bar" style="position:relative">
+   <input type="text" id="scrq" placeholder="Load a saved script: type part of its name or description" autocomplete="off" style="flex:1;min-width:260px">
+   <a class="mut" href="{{ url_for('scripts_page') }}">Manage scripts</a>
+   <div id="scrl" class="picker" hidden></div></div>
+  <div id="scrcur" class="mut">{% if script_name %}Loaded script: <b>{{ script_name }}</b>{% endif %}</div>
   <textarea name="commands" id="cmds" required placeholder="show clock&#10;show version | include uptime">{{ commands }}</textarea>
   <div class="bar"><button type="submit" name="action" value="run">Run</button>
-   <input type="text" name="script_name" id="scrname" value="{{ script_name }}" placeholder="Script name" style="width:220px">
-   <button type="submit" name="action" value="saverun" class="sec">Save and Run</button>
+   <input type="text" name="script_name" id="scrname" value="" placeholder="Script name (to save)" style="width:220px">
+   <button type="submit" name="action" value="saverun" id="saverun" class="sec" disabled>Save and Run</button>
    <span class="mut">Passwords are not stored.</span></div>
-  <div class="mut">Save and Run: saves the commands as a script (a script with the same name is replaced), then runs them.</div>
+  <div class="mut">Save and Run: saves the commands as a new script, then runs them. If the name is already used, an index is added: "name (2)".</div>
  </div>
 </form>
 """ + DEVJS + """
 <script>
 const SCRIPTS={{ scripts_json|safe }};
-document.getElementById('scr').addEventListener('change',e=>{const sc=SCRIPTS[e.target.value];
- if(sc){document.getElementById('cmds').value=sc.body;document.getElementById('scrname').value=sc.name}});
+(function(){
+ const q=document.getElementById('scrq'),l=document.getElementById('scrl'),cur=document.getElementById('scrcur'),
+       nm=document.getElementById('scrname'),sv=document.getElementById('saverun');
+ let hits=[],pos=-1;
+ function esc(t){return String(t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+ function show(){const v=q.value.trim().toLowerCase();
+  hits=SCRIPTS.filter(sc=>!v||sc.name.toLowerCase().includes(v)||sc.desc.toLowerCase().includes(v));
+  const total=hits.length;hits=hits.slice(0,50);pos=-1;
+  if(!SCRIPTS.length){l.innerHTML='<div class="mut">No script saved yet.</div>'}
+  else if(!total){l.innerHTML='<div class="mut">No match.</div>'}
+  else{l.innerHTML=hits.map((sc,i)=>'<div class="it" data-i="'+i+'"><b>'+esc(sc.name)+'</b>'+(sc.desc?' <span class="mut">'+esc(sc.desc.split(String.fromCharCode(10))[0])+'</span>':'')+'</div>').join('')+
+   (total>hits.length?'<div class="mut">'+(total-hits.length)+' more: type more characters</div>':'')}
+  l.hidden=false}
+ function pick(i){const sc=hits[i];if(!sc)return;document.getElementById('cmds').value=sc.body;
+  cur.innerHTML='Loaded script: <b>'+esc(sc.name)+'</b>';q.value='';l.hidden=true}
+ function hl(){l.querySelectorAll('.it').forEach((e,i)=>e.classList.toggle('on',i===pos))}
+ q.addEventListener('input',show);q.addEventListener('focus',show);
+ q.addEventListener('keydown',e=>{if(l.hidden)return;
+  if(e.key==='ArrowDown'){pos=Math.min(pos+1,hits.length-1);hl();e.preventDefault()}
+  else if(e.key==='ArrowUp'){pos=Math.max(pos-1,0);hl();e.preventDefault()}
+  else if(e.key==='Enter'){e.preventDefault();pick(pos<0?0:pos)}
+  else if(e.key==='Escape'){l.hidden=true}});
+ l.addEventListener('mousedown',e=>{const it=e.target.closest('.it');if(it){e.preventDefault();pick(+it.dataset.i)}});
+ q.addEventListener('blur',()=>setTimeout(()=>{l.hidden=true},150));
+ function st(){const on=nm.value.trim()!=='';sv.disabled=!on;sv.classList.toggle('sec',!on)}
+ nm.addEventListener('input',st);st();
+})();
 </script>""")
 
 RUN = """
@@ -1109,11 +1166,10 @@ MACTRACE = ("""
   <fieldset style="border:1px solid var(--line);border-radius:4px;margin:10px 0;padding:4px 10px 10px">
    <legend class="mut">IP address only: ARP lookup</legend>
    <label>Gateway (L3 device holding the ARP table)</label>
-   <select name="gw"><option value="">-- choose --</option>
-    {% for d in devices %}<option value="{{ d.ip }}|{{ d.name }}" {% if gw == d.ip ~ '|' ~ d.name %}selected{% endif %}>{{ d.name }} ({{ d.ip }})</option>{% endfor %}</select>
+   <select name="gw" id="gw" data-sel="{{ gw }}"></select>
    <label>VRF (empty = global table)</label><input type="text" name="vrf" value="{{ vrf }}" placeholder="e.g. USERS">
    <label style="font-weight:400"><input type="checkbox" name="vrf_discover" value="1" {{ 'checked' if vrf_discover == '1' }}> Discover VRFs (VRF empty: global table, then every VRF listed by <code>{{ st.vrf_cmd }}</code>)</label>
-   <div class="mut">No start switch selected: the trace starts on the gateway. An address not in the gateway ARP table
+   <div class="mut">Only the switches checked on the left are listed. An address not in the gateway ARP table
     (e.g. a gateway on another firewall or router) is reported as not found: use the MAC address.</div>
   </fieldset>
 """ + AUTHFORM + """  <label>Max hops per start switch</label><input type="text" name="max_hops" value="{{ max_hops }}" style="width:90px">
@@ -1124,7 +1180,16 @@ MACTRACE = ("""
    (<code>show mac address-table interface</code> and the <code>show lldp neighbors</code> line of the port).</div>
  </div>
 </form>
-""" + DEVJS)
+""" + DEVJS + """
+<script>
+(function(){const gw=document.getElementById('gw');let keep=gw.dataset.sel||'';
+ function fill(){const cur=gw.value||keep;keep='';const opts=[...document.querySelectorAll('#dl input:checked')].map(i=>i.value);
+  gw.innerHTML='';const o0=document.createElement('option');o0.value='';o0.textContent=opts.length?'-- choose --':'-- check switches on the left first --';gw.appendChild(o0);
+  opts.forEach(v=>{const o=document.createElement('option');const p=v.split('|');o.value=v;o.textContent=(p[1]||p[0])+' ('+p[0]+')';if(v===cur)o.selected=true;gw.appendChild(o)})}
+ document.getElementById('dl').addEventListener('change',fill);
+ document.querySelectorAll('.bar button').forEach(b=>b.addEventListener('click',()=>setTimeout(fill,0)));
+ fill();setTimeout(fill,0);})();
+</script>""")
 
 MTRUN = """
 <div class="card">
@@ -1143,7 +1208,7 @@ function dev(name,id){return id&&lnms?'<a href="'+esc(lnms)+'device/'+encodeURIC
 function draw(d){
  let h='';d.results.forEach(r=>{const x=r.extra||{};const o=open.has(r.id)?' open':'';
   let det=esc(r.error);
-  if(r.status==='resolved'&&x.macs&&x.macs.length){det=esc(r.error)+'<br>'+x.macs.map(m=>'<a href="{{ url_for("mactrace") }}?mac='+encodeURIComponent(m.mac)+'">Trace '+esc(m.mac)+'</a> <span class="mut">('+esc(m.vrf)+(m.intf?', '+esc(m.intf):'')+')</span>').join(' &nbsp; ')}
+  if(r.status==='resolved'&&x.macs&&x.macs.length){det=esc(r.error)+'<br>'+x.macs.map(m=>'<a href="{{ url_for("mactrace") }}?mac='+encodeURIComponent(m.mac)+'">Trace '+esc(m.mac)+'</a> <span class="mut">VRF='+esc(m.vrf)+(m.intf?', '+esc(m.intf):'')+'</span>').join(' &nbsp; ')}
   if(r.status==='transit'&&x.next_ip){det='VLAN '+esc(x.vlan||'-')+' - '+esc(x.intf)+(x.via&&x.via!==x.intf?' via '+esc(x.via):'')+' trunk to '+dev(x.next_name||x.next_ip,x.next_lnms_id)+' ('+esc(x.next_ip)+')'}
   if(r.output)det='<details data-id="'+r.id+'"'+o+'><summary>'+det+'</summary><pre>'+esc(r.output)+'</pre></details>';
   h+='<tr><td>'+esc(x.attempt)+'</td><td>'+esc(x.hop)+'</td><td>'+dev(r.name,r.lnms_id)+'</td><td class="mut">'+esc(r.ip)+'</td>'+
@@ -1165,23 +1230,31 @@ poll();
 SCRIPTS = """
 {% if msg %}<div class="card {{ 'err' if err else '' }}">{{ msg }}</div>{% endif %}
 <div class="card"><div class="bar"><b>Scripts</b><span class="mut">({{ scripts|length }})</span>
- <a class="btn" href="{{ url_for('script_edit', script_id=0) }}">New script</a></div>
-<table><thead><tr><th>Name</th><th>Commands</th><th>Updated</th><th></th></tr></thead><tbody>
-{% for sc in scripts %}<tr><td><a href="{{ url_for('script_edit', script_id=sc.id) }}">{{ sc.name }}</a></td>
+ <a class="btn" href="{{ url_for('script_edit', script_id=0) }}">New script</a>
+ <input type="text" id="sflt" placeholder="Filter by name, description or command" style="flex:1;min-width:240px"></div>
+<table><thead><tr><th>Name</th><th>Description</th><th>Commands</th><th>Created</th><th>Modified</th><th></th></tr></thead><tbody id="stb">
+{% for sc in scripts %}<tr data-k="{{ (sc.name ~ ' ' ~ (sc.description or '') ~ ' ' ~ sc.body)|lower }}"><td><a href="{{ url_for('script_edit', script_id=sc.id) }}">{{ sc.name }}</a></td>
+<td style="white-space:pre-line;max-width:360px">{{ sc.description or '' }}</td>
 <td><details><summary><code>{{ sc.body.splitlines()[0] if sc.body else '' }}</code>{% if sc.body.splitlines()|length > 1 %} <span class="mut">(+{{ sc.body.splitlines()|length - 1 }} lines)</span>{% endif %}</summary><pre>{{ sc.body }}</pre></details></td>
-<td class="mut">{{ sc.updated }}</td>
+<td class="mut" style="white-space:nowrap">{{ sc.created or '' }}</td><td class="mut" style="white-space:nowrap">{{ sc.updated or '' }}</td>
 <td style="white-space:nowrap"><a class="btn sec" href="{{ url_for('index', script=sc.id) }}">Use in New run</a>
  <a class="btn sec" href="{{ url_for('script_edit', script_id=sc.id) }}">Edit / rename</a>
  <form method="post" action="{{ url_for('script_delete', script_id=sc.id) }}" style="display:inline" data-name="{{ sc.name }}" onsubmit="return confirm('Delete script ' + this.dataset.name + ' ?')">
   <button type="submit" class="sec" style="color:var(--err)">Delete</button></form></td></tr>
-{% else %}<tr><td colspan="4" class="mut">No script yet. Create one here, or use "Save and Run" on the New run page.</td></tr>{% endfor %}
-</tbody></table></div>"""
+{% else %}<tr><td colspan="6" class="mut">No script yet. Create one here, or use "Save and Run" on the New run page.</td></tr>{% endfor %}
+</tbody></table></div>
+<script>
+const sf=document.getElementById('sflt'),sr=[...document.querySelectorAll('#stb tr[data-k]')];
+sf.addEventListener('input',()=>{const v=sf.value.toLowerCase();sr.forEach(r=>r.style.display=r.dataset.k.includes(v)?'':'none')});
+</script>"""
 
 SCRIPT_EDIT = """
 {% if msg %}<div class="card err">{{ msg }}</div>{% endif %}
 <form method="post" class="card" style="max-width:900px" autocomplete="off">
- <div class="bar"><b>{{ 'Edit script' if script_id else 'New script' }}</b></div>
+ <div class="bar"><b>{{ 'Edit script' if script_id else 'New script' }}</b>
+  {% if script_id %}<span class="mut">created {{ created or '-' }} - modified {{ updated or '-' }}</span>{% endif %}</div>
  <label>Name</label><input type="text" name="name" value="{{ name }}" required maxlength="80">
+ <label>Description</label><textarea name="description" style="min-height:70px;font-family:inherit" maxlength="2000">{{ description }}</textarea>
  <label>Commands (one per line, sent as typed - an empty line sends Enter)</label>
  <textarea name="body" required>{{ body }}</textarea>
  <div class="bar"><button type="submit">Save</button><a class="btn sec" href="{{ url_for('scripts_page') }}">Cancel</a></div>
@@ -1259,7 +1332,8 @@ def index():
     for sc in scripts:
         if sc["id"] == sid:
             script_id, commands, script_name = sc["id"], sc["body"], sc["name"]
-    scripts_json = json.dumps({str(sc["id"]): {"name": sc["name"], "body": sc["body"]} for sc in scripts}).replace("<", "\\u003c")
+    scripts_json = json.dumps([{"id": sc["id"], "name": sc["name"], "body": sc["body"], "desc": sc["description"] or ""}
+                               for sc in scripts]).replace("<", "\\u003c")
     return page("New run", INDEX, devices=devices, error=error, os_filter=", ".join(OS_FILTER),
                 groups=_cache.get("groups", []), st=st, lnms_url=librenms_web_url(st), devtitle="Devices",
                 scripts=scripts, scripts_json=scripts_json, script_id=script_id, commands=commands,
@@ -1275,27 +1349,27 @@ def scripts_page():
 @app.route("/scripts/<int:script_id>", methods=["GET", "POST"])
 def script_edit(script_id):
     msg = ""
+    row = None
     if script_id:
         with db() as conn:
             row = conn.execute("SELECT * FROM scripts WHERE id=?", (script_id,)).fetchone()
         if row is None:
             abort(404)
-        name, body = row["name"], row["body"]
+        name, body, description = row["name"], row["body"], row["description"] or ""
     else:
-        name, body = "", ""
+        name, body, description = "", "", ""
     if request.method == "POST":
-        name, body = request.form.get("name", ""), clean_body(request.form.get("body", ""))
+        name = request.form.get("name", "")
+        body = clean_body(request.form.get("body", ""))
+        description = request.form.get("description", "")
         if not body.strip():
             msg = "Commands required."
-        elif script_id:
-            msg = save_script(name, body, script_id)
         else:
-            with db() as conn:
-                exists = conn.execute("SELECT 1 FROM scripts WHERE name=? COLLATE NOCASE", (" ".join(name.split()),)).fetchone()
-            msg = ("A script is already named '%s'." % name) if exists else save_script(name, body)
+            msg, _saved = save_script(name, body, script_id or None, description)
         if not msg:
             return redirect(url_for("scripts_page", m="saved"))
-    return page("Scripts", SCRIPT_EDIT, script_id=script_id, name=name, body=body, msg=msg)
+    return page("Scripts", SCRIPT_EDIT, script_id=script_id, name=name, body=body, description=description,
+                msg=msg, created=row["created"] if row else "", updated=row["updated"] if row else "")
 
 
 @app.route("/scripts/<int:script_id>/delete", methods=["POST"])
@@ -1341,6 +1415,8 @@ def mactrace():
             form_error = "Select at least one start switch."
         elif target_ip and not gw_ip.strip():
             form_error = "IP address: choose the gateway (L3 device) holding the ARP table."
+        elif target_ip and gw_ip.strip() not in [x[0] for x in starts]:
+            form_error = "IP address: the gateway must be one of the switches checked on the left."
         elif vrf and not VRF_NAME_RE.match(vrf):
             form_error = "Invalid VRF name."
         else:
@@ -1469,7 +1545,7 @@ def start_run():
     if not selected or not login or not password or not commands:
         return page("Error", "<div class='card err'>Select at least one device and fill login, password and commands.</div>"), 400
     if request.form.get("action") == "saverun":
-        err = save_script(request.form.get("script_name", ""), "\n".join(commands))
+        err, _saved = save_script(request.form.get("script_name", ""), "\n".join(commands), dedup=True)
         if err:
             return page("Error", "<div class='card err'>Script not saved, nothing run: {{ e }}</div>", e=err), 400
 

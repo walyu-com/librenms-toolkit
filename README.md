@@ -49,8 +49,10 @@ sudo mv /opt/librenms/app/Plugins/<Name> /root/<Name>.removed
   NetCmd never answers a question on its own.
 - Status per device: `ok`, `potential error` (lines starting with `%`), `cmd_error` (known IOS
   errors, timeout), `conn_error`.
-- Scripts: saved command sets (Scripts menu: add, edit, rename, delete), loaded on the New run page
-  from a drop-down list; "Save and Run" saves the commands under a script name, then runs them.
+- Scripts: saved command sets with a free description and creation / modification dates (Scripts
+  menu: add, edit, rename, delete, filter). On the New run page, a search field finds a script by
+  part of its name or description and loads it; "Save and Run" (enabled once a name is typed) saves
+  the commands as a new script, then runs them; an existing name gets an index: "name (2)".
 - History in SQLite (runs, per-device outputs), text export. Passwords are never stored.
 - Settings page: links from device names to LibreNMS, `telnet://` and `ssh://` links, group badges,
   custom logo (browser tab and title bar), VRF discovery command and lookup field (MAC Trace).
@@ -61,7 +63,8 @@ sudo mv /opt/librenms/app/Plugins/<Name> /root/<Name>.removed
   (`show mac address-table interface` and the `show lldp neighbors` line of the port). Every switch
   traversed is linked to LibreNMS; traces are kept in the history with a text export. Port of
   [CiscoMacTrace](https://github.com/walyu-com/CiscoMacTrace).
-- MAC Trace by IP address: ARP lookup on a chosen gateway (L3 device). VRF field: only that VRF;
+- MAC Trace by IP address: ARP lookup on a gateway (L3 device) chosen among the switches checked
+  in the list. VRF field: only that VRF;
   VRF empty with "Discover VRFs": global table, then every VRF listed by the discovery command
   (Settings, default `show vrf brief`, VRF names read in the `Name` column); otherwise global
   table only. An IP with several MACs (VRFs) is listed, not traced. An IP whose ARP entry is on
