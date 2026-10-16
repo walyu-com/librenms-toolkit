@@ -54,6 +54,7 @@ sudo mv /opt/librenms/app/Plugins/<Name> /root/<Name>.removed
   part of its name or description and loads it; "Save and Run" (enabled once a name is typed) saves
   the commands as a new script, then runs them; an existing name gets an index: "name (2)".
 - History in SQLite (runs, per-device outputs), text export. Passwords are never stored.
+- Page footer and last line of every text export: version, Walyu PTE LTD copyright, license and source URL.
 - Settings page: links from device names to LibreNMS, `telnet://` and `ssh://` links, group badges,
   custom logo (browser tab and title bar), VRF discovery command and lookup field (MAC Trace).
 - MAC Trace page: locates the switch port of a MAC address (any notation). Start switches are chosen
