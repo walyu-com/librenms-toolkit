@@ -56,20 +56,32 @@ sudo mv /opt/librenms/app/Plugins/<Name> /root/<Name>.removed
 - History in SQLite (runs, per-device outputs), text export. Passwords are never stored.
 - Page footer and last line of every text export: version, Walyu PTE LTD copyright, license and source URL.
 - Settings page: links from device names to LibreNMS, `telnet://` and `ssh://` links, group badges,
-  custom logo (browser tab and title bar), VRF discovery command and lookup field (MAC Trace).
-- MAC Trace page: locates the switch port of a MAC address (any notation). Start switches are chosen
-  from the device list and tried in order. On each switch, `show mac address-table address <mac>`
-  gives the port; when the port (or, for a Port-channel, one of its members) is a trunk with a CDP
-  neighbor, the trace continues on the neighbor management IP; otherwise the port is the final port
-  (`show mac address-table interface` and the `show lldp neighbors` line of the port). Every switch
-  traversed is linked to LibreNMS; traces are kept in the history with a text export. Port of
+  custom logo (browser tab and title bar), VRF discovery command and lookup field, maximum MACs
+  per search (MAC Trace).
+- MAC Trace page: locates the switch port of every MAC address starting with the value typed (1 to
+  12 hexadecimal digits, any notation; a full MAC address gives one result, a vendor OUI such as
+  `00:40:8c` gives every device of that vendor). Start switches are chosen from the device list.
+  Each switch is visited once, all matching MACs are followed together: `show mac address-table |
+  include <mac>`; a MAC on a trunk with a CDP neighbor (Port-channel: one of its members) is followed
+  on the neighbor management IP, otherwise its port is the final port, with the `show lldp neighbors`
+  line of the port. Statuses: found, behind uplink (trunk without CDP neighbor, e.g. a non-Cisco
+  switch), lease only, lost, unreachable, loop. Every switch is linked to LibreNMS; results are kept
+  in the history with text and CSV exports. Port of
   [CiscoMacTrace](https://github.com/walyu-com/CiscoMacTrace).
+- MAC Trace options, applied on every visited switch: "Check ALSO DHCP Leases" (`show ip dhcp
+  binding`, all VRFs, switches serving DHCP only; a MAC found only in a lease is listed as "lease
+  only" with its last IP address) and "Resolve IP by ARP" (global table and every VRF listed by the
+  discovery command). A limit set in Settings (default 100) stops a search before tracing when the
+  start switches see more matching MACs: use a longer prefix.
 - MAC Trace by IP address: ARP lookup on a gateway (L3 device) chosen among the switches checked
   in the list. VRF field: only that VRF;
   VRF empty with "Discover VRFs": global table, then every VRF listed by the discovery command
   (Settings, default `show vrf brief`, VRF names read in the `Name` column); otherwise global
   table only. An IP with several MACs (VRFs) is listed, not traced. An IP whose ARP entry is on
   another device (e.g. a firewall) is reported as not found: use the MAC address.
+- Connection errors show the exact reason. An SSH session closed during login (paramiko
+  "transport shut down or saw EOF" or "Authentication timeout", no password checked) is retried once,
+  then Telnet is used in "SSH, then Telnet" mode; a real password refusal is never retried.
 - Configuration: `/etc/netcmd/netcmd.env` (LibreNMS URL and API token, OS filter, timeouts, port).
 
 NetCmd has no authentication of its own: restrict access to port 8090 (firewall) to the admin
